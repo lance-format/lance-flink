@@ -201,14 +201,12 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
     @Override
     public void close() throws Exception {
         LOG.info("关闭 Lance Sink");
-        
         // 刷新剩余数据
         try {
             flush();
         } catch (Exception e) {
             LOG.warn("关闭时刷新数据失败", e);
         }
-        
         if (dataset != null) {
             try {
                 dataset.close();
