@@ -60,6 +60,15 @@ public class LanceOptions implements Serializable {
             .withDescription("每次读取的批次大小，默认 1024");
 
     /**
+     * 读取行数限制（Limit 下推）
+     */
+    public static final ConfigOption<Long> READ_LIMIT = ConfigOptions
+            .key("read.limit")
+            .longType()
+            .noDefaultValue()
+            .withDescription("读取的最大行数限制（用于 Limit 下推）");
+
+    /**
      * 读取的列列表（逗号分隔）
      */
     public static final ConfigOption<String> READ_COLUMNS = ConfigOptions
@@ -340,6 +349,7 @@ public class LanceOptions implements Serializable {
 
     private final String path;
     private final int readBatchSize;
+    private final Long readLimit;
     private final List<String> readColumns;
     private final String readFilter;
     private final int writeBatchSize;
@@ -364,6 +374,7 @@ public class LanceOptions implements Serializable {
     private LanceOptions(Builder builder) {
         this.path = builder.path;
         this.readBatchSize = builder.readBatchSize;
+        this.readLimit = builder.readLimit;
         this.readColumns = builder.readColumns;
         this.readFilter = builder.readFilter;
         this.writeBatchSize = builder.writeBatchSize;
@@ -394,6 +405,10 @@ public class LanceOptions implements Serializable {
 
     public int getReadBatchSize() {
         return readBatchSize;
+    }
+
+    public Long getReadLimit() {
+        return readLimit;
     }
 
     public List<String> getReadColumns() {
@@ -495,6 +510,9 @@ public class LanceOptions implements Serializable {
 
         // Source 配置
         builder.readBatchSize(config.get(READ_BATCH_SIZE));
+        if (config.contains(READ_LIMIT)) {
+            builder.readLimit(config.get(READ_LIMIT));
+        }
         if (config.contains(READ_COLUMNS)) {
             String columnsStr = config.get(READ_COLUMNS);
             if (columnsStr != null && !columnsStr.isEmpty()) {
@@ -550,6 +568,7 @@ public class LanceOptions implements Serializable {
     public static class Builder {
         private String path;
         private int readBatchSize = 1024;
+        private Long readLimit;
         private List<String> readColumns = Collections.emptyList();
         private String readFilter;
         private int writeBatchSize = 1024;
@@ -578,6 +597,11 @@ public class LanceOptions implements Serializable {
 
         public Builder readBatchSize(int readBatchSize) {
             this.readBatchSize = readBatchSize;
+            return this;
+        }
+
+        public Builder readLimit(Long readLimit) {
+            this.readLimit = readLimit;
             return this;
         }
 
@@ -698,6 +722,11 @@ public class LanceOptions implements Serializable {
                 throw new IllegalArgumentException("read.batch-size 必须大于 0，当前值: " + readBatchSize);
             }
 
+            // 校验 Limit（如果设置了）
+            if (readLimit != null && readLimit < 0) {
+                throw new IllegalArgumentException("read.limit 必须大于等于 0，当前值: " + readLimit);
+            }
+
             // 校验写入批次大小
             if (writeBatchSize <= 0) {
                 throw new IllegalArgumentException("write.batch-size 必须大于 0，当前值: " + writeBatchSize);
@@ -757,6 +786,7 @@ public class LanceOptions implements Serializable {
         if (o == null || getClass() != o.getClass()) return false;
         LanceOptions that = (LanceOptions) o;
         return readBatchSize == that.readBatchSize &&
+                Objects.equals(readLimit, that.readLimit) &&
                 writeBatchSize == that.writeBatchSize &&
                 writeMaxRowsPerFile == that.writeMaxRowsPerFile &&
                 indexNumPartitions == that.indexNumPartitions &&
@@ -782,7 +812,7 @@ public class LanceOptions implements Serializable {
 
     @Override
     public int hashCode() {
-        return Objects.hash(path, readBatchSize, readColumns, readFilter, writeBatchSize, writeMode,
+        return Objects.hash(path, readBatchSize, readLimit, readColumns, readFilter, writeBatchSize, writeMode,
                 writeMaxRowsPerFile, indexType, indexColumn, indexNumPartitions, indexNumSubVectors,
                 indexNumBits, indexMaxLevel, indexM, indexEfConstruction, vectorColumn, vectorMetric,
                 vectorNprobes, vectorEf, vectorRefineFactor, defaultDatabase, warehouse);
@@ -793,6 +823,7 @@ public class LanceOptions implements Serializable {
         return "LanceOptions{" +
                 "path='" + path + '\'' +
                 ", readBatchSize=" + readBatchSize +
+                ", readLimit=" + readLimit +
                 ", readColumns=" + readColumns +
                 ", readFilter='" + readFilter + '\'' +
                 ", writeBatchSize=" + writeBatchSize +

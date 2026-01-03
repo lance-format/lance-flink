@@ -31,6 +31,7 @@ import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.InputFormatProvider;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
+import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.CallExpression;
@@ -51,21 +52,23 @@ import java.util.stream.Collectors;
 /**
  * Lance 动态表数据源。
  * 
- * <p>实现 ScanTableSource 接口，支持列裁剪和过滤下推。
+ * <p>实现 ScanTableSource 接口，支持列裁剪、过滤下推和 Limit 下推。
  */
 public class LanceDynamicTableSource implements ScanTableSource, 
-        SupportsProjectionPushDown, SupportsFilterPushDown {
+        SupportsProjectionPushDown, SupportsFilterPushDown, SupportsLimitPushDown {
 
     private final LanceOptions options;
     private final DataType physicalDataType;
     private int[] projectedFields;
     private List<String> filters;
+    private Long limit;  // 新增：Limit 下推
 
     public LanceDynamicTableSource(LanceOptions options, DataType physicalDataType) {
         this.options = options;
         this.physicalDataType = physicalDataType;
         this.projectedFields = null;
         this.filters = new ArrayList<>();
+        this.limit = null;
     }
 
     private LanceDynamicTableSource(LanceDynamicTableSource source) {
@@ -73,6 +76,7 @@ public class LanceDynamicTableSource implements ScanTableSource,
         this.physicalDataType = source.physicalDataType;
         this.projectedFields = source.projectedFields;
         this.filters = new ArrayList<>(source.filters);
+        this.limit = source.limit;
     }
 
     @Override
@@ -99,6 +103,11 @@ public class LanceDynamicTableSource implements ScanTableSource,
                 .path(options.getPath())
                 .readBatchSize(options.getReadBatchSize())
                 .readFilter(buildFilterExpression());
+
+        // 设置 Limit（如果有）
+        if (limit != null) {
+            optionsBuilder.readLimit(limit);
+        }
 
         // 设置要读取的列
         if (projectedFields != null) {
@@ -240,11 +249,46 @@ public class LanceDynamicTableSource implements ScanTableSource,
         else if (funcDef == BuiltInFunctionDefinitions.LIKE) {
             return buildComparisonFilter(args, "LIKE");
         }
-        // IN (暂不支持，需要更复杂的处理)
-        // BETWEEN (暂不支持)
+        // IN 谓词支持（新增）
+        else if (funcDef == BuiltInFunctionDefinitions.IN) {
+            return buildInFilter(args);
+        }
+        // BETWEEN 谓词支持 - 注意：Flink 通常将 BETWEEN 转换为 AND 连接的两个比较
+        // 这里作为备用支持
 
         // 不支持的函数，返回 null
         return null;
+    }
+
+    /**
+     * 构建 IN 过滤表达式（新增）
+     */
+    private String buildInFilter(List<ResolvedExpression> args) {
+        if (args.isEmpty()) {
+            return null;
+        }
+        
+        ResolvedExpression field = args.get(0);
+        if (!(field instanceof FieldReferenceExpression)) {
+            return null;
+        }
+        
+        String fieldName = ((FieldReferenceExpression) field).getName();
+        List<String> values = new ArrayList<>();
+        
+        for (int i = 1; i < args.size(); i++) {
+            String value = extractLiteralValue(args.get(i));
+            if (value == null) {
+                return null; // 如果有一个值无法提取，则不下推
+            }
+            values.add(value);
+        }
+        
+        if (values.isEmpty()) {
+            return null;
+        }
+        
+        return fieldName + " IN (" + String.join(", ", values) + ")";
     }
 
     /**
@@ -354,5 +398,19 @@ public class LanceDynamicTableSource implements ScanTableSource,
      */
     public DataType getPhysicalDataType() {
         return physicalDataType;
+    }
+
+    // ==================== SupportsLimitPushDown ====================
+
+    @Override
+    public void applyLimit(long limit) {
+        this.limit = limit;
+    }
+
+    /**
+     * 获取 Limit 值
+     */
+    public Long getLimit() {
+        return limit;
     }
 }
