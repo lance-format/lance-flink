@@ -156,7 +156,14 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
             converter.toVectorSchemaRoot(buffer, root);
             
             String datasetPath = options.getPath();
-            
+
+            // A peer subtask may have created the dataset since this sink opened (multi-subtask
+            // first write). Re-check existence BEFORE Fragment.write below, which itself creates
+            // the dataset data directory and would otherwise make Files.exists unreliable.
+            if (!datasetExists && Files.exists(Paths.get(datasetPath))) {
+                datasetExists = true;
+            }
+
             // Build write parameters
             WriteParams writeParams = new WriteParams.Builder()
                     .withMaxRowsPerFile(options.getWriteMaxRowsPerFile())
