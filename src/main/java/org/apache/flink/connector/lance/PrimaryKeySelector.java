@@ -50,6 +50,18 @@ public class PrimaryKeySelector implements KeySelector<RowData, RowData> {
 
     @Override
     public RowData getKey(RowData value) {
+        return project(value, keyIndices, keyTypes);
+    }
+
+    /**
+     * Project the primary-key columns out of a {@link RowData} into a freshly allocated
+     * {@link GenericRowData} that honors {@code equals}/{@code hashCode}.
+     *
+     * <p>Centralizing the projection here keeps the {@code keyBy} routing key (this class) and
+     * the sink's in-memory buffer key ({@code LanceUpsertSink}) byte-for-byte identical; any
+     * drift between the two would silently break the "same PK routed to same subtask" contract.
+     */
+    public static RowData project(RowData value, int[] keyIndices, LogicalType[] keyTypes) {
         GenericRowData key = new GenericRowData(keyIndices.length);
         for (int i = 0; i < keyIndices.length; i++) {
             key.setField(i, RowDataFieldAccessor.readField(value, keyIndices[i], keyTypes[i]));

@@ -21,7 +21,6 @@ package org.apache.flink.connector.lance;
 import org.lance.Dataset;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +32,11 @@ import java.util.Map;
  * <p>Lance has no native primary-key constraint; the connector stores the ordered key column
  * names under a reserved config key via {@link Dataset#updateConfig(Map)} and restores them via
  * {@link Dataset#getConfig()}.
+ *
+ * <p><b>Encoding limitation</b>: column names are joined with a literal comma. Names containing
+ * a comma are rejected in {@link #persist} to keep round-trip decoding unambiguous. Flink /
+ * Arrow / Lance schema tooling in practice constrain identifiers to a comma-free character
+ * class, so this restriction is not observable in normal usage.
  */
 public final class PrimaryKeyPersistence {
 
@@ -48,10 +52,23 @@ public final class PrimaryKeyPersistence {
      *
      * @param dataset     the Lance dataset (must already be materialized)
      * @param primaryKeys ordered primary-key column names; empty/null writes nothing
+     * @throws IllegalArgumentException if any column name contains a comma (which would make
+     *                                  the comma-delimited encoding ambiguous on load)
      */
     public static void persist(Dataset dataset, List<String> primaryKeys) {
         if (dataset == null || primaryKeys == null || primaryKeys.isEmpty()) {
             return;
+        }
+        for (String column : primaryKeys) {
+            if (column == null || column.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Primary-key column names must be non-empty; got: " + primaryKeys);
+            }
+            if (column.indexOf(',') >= 0) {
+                throw new IllegalArgumentException(
+                        "Primary-key column name must not contain a comma (would corrupt the "
+                                + "comma-delimited encoding): '" + column + "'");
+            }
         }
         dataset.updateConfig(Collections.singletonMap(PK_CONFIG_KEY, String.join(",", primaryKeys)));
     }
