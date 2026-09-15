@@ -735,18 +735,44 @@ public class LanceCatalog extends AbstractCatalog {
             dataset.updateConfig(toSet);
         }
 
+        // UNSET is applied conservatively: we only remove keys that Flink itself might have
+        // written. Any config key using a namespaced form ("engine.category.name") is treated
+        // as potentially owned by a sister engine (Spark / Trino / Ray) and left untouched,
+        // even if it looks like a user TBLPROPERTY by our own classifier. Keys the user
+        // explicitly re-sets in this ALTER stay writable via the toSet path above.
+        //
+        // TODO(follow-up A7): move to a "Flink writes under flink.* namespace only" model so
+        // this heuristic can be replaced with an exact prefix match.
         Set<String> toUnset = new HashSet<>();
         for (String key : dataset.getConfig().keySet()) {
             if (PrimaryKeyPersistence.PK_CONFIG_KEY.equals(key)) {
                 continue;
             }
-            if (isTblProperty(key) && !options.containsKey(key)) {
-                toUnset.add(key);
+            if (!isTblProperty(key)) {
+                continue;
             }
+            if (options.containsKey(key)) {
+                continue;
+            }
+            if (isForeignNamespacedKey(key)) {
+                LOG.debug("Skipping UNSET of foreign-namespaced config key: {}", key);
+                continue;
+            }
+            toUnset.add(key);
         }
         if (!toUnset.isEmpty()) {
             dataset.deleteConfigKeys(toUnset);
         }
+    }
+
+    /**
+     * Whether the given config key looks like it was written by another engine (Spark, Trino,
+     * Ray, ...). We use a simple heuristic: a key containing a dot ({@code engine.some.prop})
+     * is treated as namespaced and therefore not ours to delete. The Flink primary-key metadata
+     * key ({@link PrimaryKeyPersistence#PK_CONFIG_KEY}) is filtered separately by the caller.
+     */
+    private static boolean isForeignNamespacedKey(String key) {
+        return key != null && key.indexOf('.') >= 0;
     }
 
     private boolean isTblProperty(String key) {

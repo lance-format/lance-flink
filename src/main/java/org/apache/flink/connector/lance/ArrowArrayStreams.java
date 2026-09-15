@@ -43,7 +43,7 @@ import java.io.IOException;
  * consumes the reader (whose lifecycle is owned by the stream's release callback); the record
  * batch itself is closed by the caller here once the merge completes.
  */
-public final class ArrowArrayStreams {
+final class ArrowArrayStreams {
 
     private ArrowArrayStreams() {
         // utility class
@@ -58,7 +58,7 @@ public final class ArrowArrayStreams {
      * @param root    populated data batch
      * @return the merge-insert result
      */
-    public static MergeInsertResult mergeInsert(
+    static MergeInsertResult mergeInsert(
             Dataset dataset,
             MergeInsertParams params,
             BufferAllocator allocator,

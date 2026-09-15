@@ -26,7 +26,6 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
-import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.BigIntType;
@@ -41,14 +40,9 @@ import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.types.RowKind;
 
-import org.lance.CommitBuilder;
 import org.lance.Dataset;
-import org.lance.Fragment;
-import org.lance.FragmentMetadata;
-import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.merge.MergeInsertParams;
-import org.lance.operation.Overwrite;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -57,11 +51,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,9 +65,9 @@ import java.util.Map;
  * Keyed sink for Lance tables declared with a primary key.
  *
  * <p>Unlike {@link LanceSink} (append-only), this sink supports the CDC changelog kinds
- * {@code +I}/{@code +U}/{-D}. It relies on {@code DataStream#keyBy} upstream to guarantee that all
- * events for a given primary key arrive at the same subtask in order; it then collapses the
- * buffered events per key to a single final action and applies it at checkpoint boundaries:
+ * {@code +I}/{@code +U}/{@code -D}. It relies on {@code DataStream#keyBy} upstream to guarantee
+ * that all events for a given primary key arrive at the same subtask in order; it then collapses
+ * the buffered events per key to a single final action and applies it at checkpoint boundaries:
  *
  * <ul>
  *   <li>{@code INSERT}/{@code UPDATE_AFTER} &rarr; native upsert via
@@ -81,6 +76,46 @@ import java.util.Map;
  *   <li>{@code DELETE} &rarr; {@link Dataset#delete} with an OR-of-AND predicate.</li>
  *   <li>{@code UPDATE_BEFORE} &rarr; dropped (upsert has no need for the old value).</li>
  * </ul>
+ *
+ * <h3>Consistency model</h3>
+ * <p>This sink provides <b>at-least-once</b> semantics, not exactly-once:
+ * <ul>
+ *   <li>Persistence boundary is the Flink checkpoint (via {@link #snapshotState}). The in-memory
+ *       buffer is <em>not</em> checkpointed; recovery relies on the upstream source being
+ *       replayable (Kafka / Debezium / CDC connectors are fine; unbounded non-replayable sources
+ *       such as socket/file will lose in-flight rows on TM failure).</li>
+ *   <li>Within a single {@code flush()}, {@code DELETE} operations are applied <b>before</b>
+ *       {@code UPSERT} operations, so that a half-failed flush never leaves a superseded row
+ *       behind. The per-key collapsing in the buffer additionally ensures replay idempotency for
+ *       both operations.</li>
+ *   <li>{@code close()} does <b>not</b> flush: Flink invokes {@code close()} on cancellation and
+ *       recovery as well, and writing on those paths would violate the "checkpoint is the
+ *       persistence boundary" contract. Un-checkpointed rows in the buffer are dropped on close
+ *       and will be re-delivered by the source on restart.</li>
+ * </ul>
+ *
+ * <h3>Concurrency and first-write</h3>
+ * <p>The sink uses an <b>open-or-create</b> strategy in {@link #open}: it first tries
+ * {@link Dataset#open}, and if that fails it falls back to
+ * {@link Dataset#create(BufferAllocator, String, Schema, WriteParams)} which is atomic in the
+ * Lance native layer. Concurrent first-writes from multiple subtasks therefore either observe
+ * the same dataset (both {@code open} succeeds) or race on {@code create} (one wins, others fall
+ * back to {@code open}); either way no {@code Overwrite} clobber can occur.
+ *
+ * <p>This deliberately replaces the previous {@code Files.exists()} check, which is only correct
+ * for the local filesystem and would silently mis-classify remote paths (s3://, tbdsfs://) as
+ * non-existent, causing every subtask to re-create and clobber the dataset.
+ *
+ * <h3>Hot keys and buffering</h3>
+ * <p>Because {@code keyBy} routes all events for a given primary key to a single subtask, a
+ * skewed key distribution (one dominant key) will bottleneck the whole pipeline on that
+ * subtask. Two-level hashing is not applicable — it would break in-key ordering, which the
+ * delete-before-upsert per-flush invariant depends on. Callers with a known-skewed natural PK
+ * should salt or composite the key at the SQL layer.
+ *
+ * <p>The per-key buffer is bounded by {@code write.batch-size}: once the collapsed key count
+ * reaches the threshold, {@link #flush} is invoked between events (never mid-flush), keeping
+ * heap usage predictable in the gap between checkpoints.
  */
 public class LanceUpsertSink extends RichSinkFunction<RowData> implements CheckpointedFunction {
 
@@ -91,6 +126,7 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     private final RowType rowType;
     private final List<String> primaryKeys;
     private final int[] keyIndices;
+    private final LogicalType[] keyTypes;
 
     private transient BufferAllocator allocator;
     private transient Dataset dataset;
@@ -104,13 +140,24 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
         this.rowType = rowType;
         this.primaryKeys = primaryKeys;
         this.keyIndices = keyIndices;
+        // Pre-resolve key types once so extractKey doesn't dispatch through rowType per event,
+        // and so the buffer key and the keyBy routing key (PrimaryKeySelector) share the exact
+        // same projection logic (see PrimaryKeySelector#project).
+        this.keyTypes = new LogicalType[keyIndices.length];
+        for (int i = 0; i < keyIndices.length; i++) {
+            this.keyTypes[i] = rowType.getTypeAt(keyIndices[i]);
+        }
     }
 
     @Override
     public void open(Configuration parameters) throws Exception {
         super.open(parameters);
 
-        LOG.info("Opening Lance Upsert Sink: {}", options.getPath());
+        String datasetPath = options.getPath();
+        if (datasetPath == null || datasetPath.isEmpty()) {
+            throw new IllegalArgumentException("Lance dataset path cannot be empty");
+        }
+        LOG.info("Opening Lance Upsert Sink: {}", datasetPath);
 
         this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.buffer = new LinkedHashMap<>();
@@ -118,48 +165,95 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
         this.converter = new RowDataConverter(rowType);
         this.arrowSchema = LanceTypeConverter.toArrowSchema(rowType);
 
-        String datasetPath = options.getPath();
-        if (datasetPath == null || datasetPath.isEmpty()) {
-            throw new IllegalArgumentException("Lance dataset path cannot be empty");
+        // OVERWRITE mode: only supported for local filesystem paths. For remote storage the
+        // truncation must be performed at DDL time (e.g. via catalog CREATE OR REPLACE) — the
+        // sink cannot reliably drop a remote dataset without an SDK-provided API.
+        if (options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
+            if (isLocalPath(datasetPath)) {
+                Path path = Paths.get(datasetPath);
+                if (Files.exists(path)) {
+                    LOG.info("Overwrite mode, deleting existing local dataset: {}", datasetPath);
+                    deleteDirectory(path);
+                }
+            } else {
+                throw new UnsupportedOperationException(
+                        "write.mode=overwrite is not supported for remote storage in the upsert "
+                                + "sink. Please drop/recreate the table via the catalog before writing. "
+                                + "Path: " + datasetPath);
+            }
         }
 
-        Path path = Paths.get(datasetPath);
-        boolean datasetExists = Files.exists(path);
+        // Open-or-create: atomic in the Lance native layer, safe under concurrent first-writes.
+        this.dataset = openOrCreate(datasetPath);
 
-        if (datasetExists && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
-            LOG.info("Overwrite mode, deleting existing dataset: {}", datasetPath);
-            deleteDirectory(path);
-            datasetExists = false;
-        }
-
-        if (datasetExists) {
-            this.dataset = Dataset.open(datasetPath, allocator);
-        }
+        // Persist the primary keys into the dataset config. Idempotent; safe to call on every open.
+        PrimaryKeyPersistence.persist(dataset, primaryKeys);
 
         LOG.info("Lance Upsert Sink opened, primary keys: {}", primaryKeys);
     }
 
+    /**
+     * Return an open {@link Dataset} handle, creating an empty dataset first if it does not yet
+     * exist. This unifies first-write and steady-state paths so that both go through
+     * {@code mergeInsert}/{@code delete}, eliminating the previous {@code Overwrite}-based
+     * first-write that could clobber peer subtasks' commits.
+     */
+    private Dataset openOrCreate(String datasetPath) throws IOException {
+        try {
+            return Dataset.open(datasetPath, allocator);
+        } catch (Exception openFailure) {
+            LOG.debug("Dataset.open failed ({}), attempting create for: {}",
+                    openFailure.getMessage(), datasetPath);
+            try {
+                return Dataset.create(
+                        allocator, datasetPath, arrowSchema, new WriteParams.Builder().build());
+            } catch (Exception createFailure) {
+                // A peer subtask likely won the create race; try open once more.
+                try {
+                    return Dataset.open(datasetPath, allocator);
+                } catch (Exception reopenFailure) {
+                    IOException io = new IOException(
+                            "Failed to open or create Lance dataset: " + datasetPath, reopenFailure);
+                    io.addSuppressed(createFailure);
+                    io.addSuppressed(openFailure);
+                    throw io;
+                }
+            }
+        }
+    }
+
     @Override
-    public void invoke(RowData value, Context context) {
+    public void invoke(RowData value, Context context) throws IOException {
         RowKind kind = value.getRowKind();
         switch (kind) {
             case INSERT:
             case UPDATE_AFTER:
-                buffer.put(extractKey(value), value);
-                break;
             case DELETE:
                 buffer.put(extractKey(value), value);
                 break;
             case UPDATE_BEFORE:
                 // upsert has no use for the old value
-                break;
+                return;
             default:
                 LOG.warn("Ignoring unsupported RowKind: {}", kind);
+                return;
+        }
+        // Bound the buffer: without this, a large gap between checkpoints combined with a wide
+        // key space produces unbounded heap growth. This early flush is safe because it happens
+        // between events (never mid-flush), so the delete-before-upsert invariant per flush and
+        // the per-key collapsing invariant within one flush are both preserved.
+        if (buffer.size() >= options.getWriteBatchSize()) {
+            flush();
         }
     }
 
     /**
      * Flush the collapsed per-key buffer to Lance.
+     *
+     * <p>Deletes are applied <b>before</b> upserts within a flush: this guarantees that if the
+     * flush half-fails, the target never contains a stale row that should have been superseded.
+     * Combined with per-key collapsing (only the last event per key is kept), the operation is
+     * idempotent under upstream replay.
      */
     public void flush() throws IOException {
         if (buffer.isEmpty()) {
@@ -176,69 +270,21 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
             }
         }
 
-        if (dataset == null) {
-            // First write: create the dataset from upserts only (deletes have no target yet).
-            if (upserts.isEmpty()) {
-                buffer.clear();
-                return;
-            }
-            createDataset(upserts);
-            PrimaryKeyPersistence.persist(dataset, primaryKeys);
-            totalWrittenRows += upserts.size();
-        } else {
-            if (!upserts.isEmpty()) {
-                mergeInsertRows(upserts);
-            }
-            if (!deletes.isEmpty()) {
-                deleteRows(deletes);
-            }
-            totalWrittenRows += upserts.size() + deletes.size();
+        // Delete first, so a partial failure never leaves a row we intended to remove.
+        if (!deletes.isEmpty()) {
+            deleteRows(deletes);
+        }
+        if (!upserts.isEmpty()) {
+            mergeInsertRows(upserts);
         }
 
+        totalWrittenRows += upserts.size() + deletes.size();
         buffer.clear();
     }
 
     /**
-     * Create the dataset on first write (equivalent to {@code INSERT} into an empty target).
-     */
-    private void createDataset(List<RowData> rows) throws IOException {
-        String datasetPath = options.getPath();
-
-        // A peer subtask may have created the dataset since this sink opened (multi-subtask first
-        // write). Falling back to merge-insert avoids clobbering its data with Overwrite.
-        if (Files.exists(Paths.get(datasetPath))) {
-            this.dataset = Dataset.open(datasetPath, allocator);
-            mergeInsertRows(rows);
-            return;
-        }
-
-        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
-            converter.toVectorSchemaRoot(rows, root);
-
-            WriteParams writeParams = new WriteParams.Builder()
-                    .withMaxRowsPerFile(options.getWriteMaxRowsPerFile())
-                    .build();
-
-            List<FragmentMetadata> fragments = Fragment.write()
-                    .datasetUri(datasetPath)
-                    .allocator(allocator)
-                    .data(root)
-                    .writeParams(writeParams)
-                    .execute();
-
-            Overwrite operation = Overwrite.builder().fragments(fragments).schema(arrowSchema).build();
-            CommitBuilder builder = new CommitBuilder(datasetPath, allocator)
-                    .writeParams(Collections.emptyMap());
-            try (Transaction txn = new Transaction.Builder().operation(operation).build()) {
-                dataset = builder.execute(txn);
-            }
-        } catch (Exception e) {
-            throw new IOException("Failed to create Lance dataset: " + datasetPath, e);
-        }
-    }
-
-    /**
-     * Apply native upsert via {@code mergeInsert}.
+     * Apply native upsert via {@code mergeInsert}. Also handles the "insert into empty dataset"
+     * case, since the dataset was materialized empty in {@link #open}.
      */
     private void mergeInsertRows(List<RowData> rows) throws IOException {
         MergeInsertParams params = new MergeInsertParams(primaryKeys)
@@ -273,6 +319,14 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
                 String column = rowType.getFieldNames().get(keyIndex);
                 LogicalType type = rowType.getTypeAt(keyIndex);
                 Object value = RowDataFieldAccessor.readField(row, keyIndex, type);
+                if (value == null) {
+                    // NULL primary keys cannot participate in an equality predicate
+                    // (col = NULL is UNKNOWN in SQL, so the row would never be matched
+                    // and the delete would silently no-op). Reject explicitly.
+                    throw new IllegalStateException(
+                            "NULL primary-key value is not supported for DELETE on column '"
+                                    + column + "'");
+                }
                 ands.add(column + " = " + formatSqlValue(value, type));
             }
             ors.add("(" + String.join(" AND ", ands) + ")");
@@ -284,14 +338,26 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
      * Format a primary-key value as a Lance SQL literal.
      */
     private String formatSqlValue(Object value, LogicalType type) {
-        if (value == null) {
-            return "NULL";
-        }
         if (type instanceof TinyIntType || type instanceof SmallIntType
                 || type instanceof IntType || type instanceof BigIntType
-                || type instanceof FloatType || type instanceof DoubleType
                 || type instanceof BooleanType) {
             return value.toString();
+        }
+        if (type instanceof FloatType) {
+            float f = (Float) value;
+            if (!Float.isFinite(f)) {
+                throw new IllegalStateException(
+                        "Non-finite float primary-key value (" + f + ") is not supported for DELETE");
+            }
+            return Float.toString(f);
+        }
+        if (type instanceof DoubleType) {
+            double d = (Double) value;
+            if (!Double.isFinite(d)) {
+                throw new IllegalStateException(
+                        "Non-finite double primary-key value (" + d + ") is not supported for DELETE");
+            }
+            return Double.toString(d);
         }
         if (type instanceof VarCharType) {
             StringData stringData = (StringData) value;
@@ -304,18 +370,19 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     /**
      * Project the primary-key columns into a key that honors equals/hashCode.
      */
+    /**
+     * Project the primary-key columns into a key that honors equals/hashCode. Delegates to
+     * {@link PrimaryKeySelector#project} so the buffer key here is byte-for-byte identical to
+     * the {@code keyBy} routing key upstream.
+     */
     private RowData extractKey(RowData value) {
-        GenericRowData key = new GenericRowData(keyIndices.length);
-        for (int i = 0; i < keyIndices.length; i++) {
-            key.setField(i,
-                    RowDataFieldAccessor.readField(value, keyIndices[i], rowType.getTypeAt(keyIndices[i])));
-        }
-        return key;
+        return PrimaryKeySelector.project(value, keyIndices, keyTypes);
     }
 
     @Override
     public void snapshotState(FunctionSnapshotContext context) throws Exception {
         LOG.debug("Snapshot state, checkpointId: {}", context.getCheckpointId());
+        // Persistence boundary: only checkpoint triggers a flush.
         flush();
     }
 
@@ -327,11 +394,9 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     @Override
     public void close() throws Exception {
         LOG.info("Closing Lance Upsert Sink");
-        try {
-            flush();
-        } catch (Exception e) {
-            LOG.warn("Failed to flush data on close", e);
-        }
+        // Do NOT flush here: close() runs on cancel/restart as well; writing on those paths
+        // would violate the "checkpoint is the persistence boundary" contract. Rows still in
+        // buffer are dropped and will be re-delivered by the (replayable) source on restart.
         if (dataset != null) {
             try {
                 dataset.close();
@@ -352,15 +417,32 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
         super.close();
     }
 
+    /**
+     * Whether the given path denotes the local filesystem (as opposed to s3://, tbdsfs://, hdfs://
+     * etc.). A path with no scheme, or the explicit {@code file:} scheme, is considered local.
+     */
+    private static boolean isLocalPath(String path) {
+        try {
+            URI uri = new URI(path);
+            String scheme = uri.getScheme();
+            return scheme == null || "file".equalsIgnoreCase(scheme);
+        } catch (URISyntaxException e) {
+            // A parse failure means it's almost certainly a plain local path.
+            return true;
+        }
+    }
+
     private void deleteDirectory(Path path) throws IOException {
         if (Files.isDirectory(path)) {
-            Files.list(path).forEach(child -> {
-                try {
-                    deleteDirectory(child);
-                } catch (IOException e) {
-                    LOG.warn("Failed to delete file: {}", child, e);
-                }
-            });
+            try (java.util.stream.Stream<Path> children = Files.list(path)) {
+                children.forEach(child -> {
+                    try {
+                        deleteDirectory(child);
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to delete file: " + child, e);
+                    }
+                });
+            }
         }
         Files.deleteIfExists(path);
     }

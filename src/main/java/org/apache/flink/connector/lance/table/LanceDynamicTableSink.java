@@ -108,11 +108,14 @@ public class LanceDynamicTableSink implements DynamicTableSink {
             @Override
             public DataStreamSink<?> consumeDataStream(
                     ProviderContext providerContext, DataStream<RowData> dataStream) {
-                DataStream<RowData> keyed =
-                        dataStream.keyBy(new PrimaryKeySelector(primaryKeyIndices, primaryKeyTypes));
+                DataStream<RowData> keyed = dataStream
+                        .keyBy(new PrimaryKeySelector(primaryKeyIndices, primaryKeyTypes));
                 LanceUpsertSink upsertSink =
                         new LanceUpsertSink(options, rowType, primaryKeys, primaryKeyIndices);
-                return keyed.addSink(upsertSink);
+                DataStreamSink<RowData> sink = keyed.addSink(upsertSink).name("LanceUpsertSink");
+                // Assign a stable UID so state mapping survives job upgrades / savepoints.
+                providerContext.generateUid("lance-upsert-sink").ifPresent(sink::uid);
+                return sink;
             }
         };
     }
