@@ -108,4 +108,34 @@ DECIMAL、后用 MAP，两者各自获得映射后都得换；现已改用 `MULT
 
 - 2.1 与 2.2 数据集能否在同一路径混用（时间旅行读旧版本）。
 - 2.2 是否影响其他类型的编码或既有索引。
-- `MULTISET`（Flink 侧是 `Map<T, Integer>`）仍无映射，推测同受 2.2 限制，未实测。
+
+## MULTISET —— 已完成
+
+推测得到证实：MULTISET 形状的 map（`Map<Utf8, Int32>`）在 2.1 上建表成功、写入失败，报的
+是与 MAP 完全相同的 `Map data type is only supported in Lance file format 2.2+
+(lance-encoding/src/encoder.rs:485)`。2.2 上写入正常。
+
+实现完全复用 MAP 的通路：探针确认 `MultisetType.getDefaultConversion()` 是
+`java.util.Map`、`RowData.getMap()` 可用，因此 MULTISET 在运行时就是 `MapData`。
+`readMap`/`writeMap` 的签名从收 `MapType` 改为直接收 key/value 两个 `LogicalType`，MAP 与
+MULTISET 共用同一实现，不存在平行分支。count 侧固定为非空 INT32。
+
+`LanceCatalog` 的版本校验无需改动——`containsMap` 按 `ArrowType.Map` 判断，MULTISET 映射成
+同一 Arrow 类型，自动覆盖。`setNull` 同理，上一轮加的 MapVector 前置分支直接生效。
+
+### 一个有意接受的不对称
+
+MULTISET 列**读回后呈现为 `MAP<element, INT>`**。Arrow map 不携带任何可区分
+`MAP<T NOT NULL, INT>` 与 `MULTISET<T NOT NULL>` 的信息，而 MAP 是远更常见的声明，因此无
+标记的 map 一律解析为 MAP。
+
+我实测过打元数据的可行性：`FieldType` 支持自定义 metadata，且 Lance **确实**原样往返了
+`{flink.type=MULTISET}`。技术上可行，但我选择不用——这会为一个极少作为表列声明的类型
+（MULTISET 主要来自 `COLLECT()` 聚合结果）在跨引擎共读的 schema 里塞进一个 `flink.` 专有
+键，正是 A7 遗留项在推动消除的那类耦合。写入与存储数据不受影响，仅恢复出的类型名不同。
+
+### 「不支持类型」测试样本第四次搬家，这次应该是最后一次
+
+`LanceNamespaceCatalogSchemaTest` 的样本历经 DECIMAL → MAP → MULTISET，现改为
+`INTERVAL`。前三者都是 Lance 真正会存储的数据类型，所以迟早都会获得映射；区间类型不属于
+分析存储的数据，不在这条路径上。

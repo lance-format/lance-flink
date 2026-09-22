@@ -67,6 +67,34 @@ narrower than what a top-level column accepts — the same limit applies to
 than on the first write. An empty map and a `NULL` map are stored distinctly. A
 `NULL` value is allowed; a `NULL` key is not.
 
+### MULTISET columns
+
+A `MULTISET` is stored as `MAP<element, count>`, so it carries the same 2.2
+requirement, the same element type restrictions, and the same `NOT NULL` rule —
+the element becomes the map key:
+
+```sql
+-- Rejected: DataTypes.MULTISET(DataTypes.STRING()) yields a nullable element.
+CREATE TABLE t (tags MULTISET<STRING>) WITH (...);
+
+-- Correct.
+CREATE TABLE t (tags MULTISET<STRING NOT NULL>) WITH (
+  'write.data-storage-version' = '2.2', ...
+);
+```
+
+The count side is always a non-null `INT`, since an element that is present has
+an occurrence count by definition.
+
+One asymmetry is worth knowing about: a `MULTISET` column **reads back as
+`MAP<element, INT>`**. An Arrow map carries nothing that separates
+`MAP<T NOT NULL, INT>` from `MULTISET<T NOT NULL>`, and `MAP` is the far more
+common declaration, so an untagged map resolves to `MAP`. Writes are unaffected,
+and the stored data is identical either way — only the recovered type name
+differs. Tagging the field with metadata would make the distinction survive, but
+it would put a Flink-specific key into a schema other engines also read, so it
+is deliberately not done.
+
 ### Vector index
 
 | Option | Required | Default | Description |

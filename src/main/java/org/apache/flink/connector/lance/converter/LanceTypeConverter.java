@@ -32,6 +32,7 @@ import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.MapType;
+import org.apache.flink.table.types.logical.MultisetType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimeType;
@@ -320,6 +321,21 @@ public class LanceTypeConverter implements Serializable {
             // keysSorted=false: nothing in the write path sorts entries, and claiming otherwise
             // would let a reader skip its own ordering work on unordered data.
             arrowType = new ArrowType.Map(false);
+        } else if (logicalType instanceof MultisetType) {
+            // A MULTISET is physically a MAP<element, count>, which is also how Flink represents it
+            // at runtime (getDefaultConversion is java.util.Map, and RowData.getMap works on it).
+            // So it reuses the map encoding wholesale rather than getting its own.
+            MultisetType multisetType = (MultisetType) logicalType;
+            LogicalType elementType = multisetType.getElementType();
+            if (elementType.isNullable()) {
+                throw new UnsupportedTypeException(
+                        "MULTISET element must be NOT NULL for column '" + name + "': the element "
+                                + "becomes an Arrow map key, which cannot be nullable. Declare it "
+                                + "as e.g. MULTISET<STRING NOT NULL>.");
+            }
+            children = new ArrayList<>();
+            children.add(multisetEntriesField(name, elementType));
+            arrowType = new ArrowType.Map(false);
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             children = new ArrayList<>();
@@ -351,8 +367,8 @@ public class LanceTypeConverter implements Serializable {
         // Arrow accepts far more element types here than the read/write path can actually move, so
         // an unchecked MAP<STRING, DATE> would create a table whose first write fails deep in the
         // converter. Reject it at DDL time instead, where the message can name the column.
-        requireSupportedMapElement(mapColumnName, "key", keyType);
-        requireSupportedMapElement(mapColumnName, "value", valueType);
+        requireSupportedMapElement(mapColumnName, "MAP key", keyType);
+        requireSupportedMapElement(mapColumnName, "MAP value", valueType);
 
         Field keyField = flinkTypeToArrowField(MapVector.KEY_NAME, keyType);
         if (keyField.isNullable()) {
@@ -377,11 +393,48 @@ public class LanceTypeConverter implements Serializable {
     }
 
     /**
+     * Build the {@code entries} struct backing a multiset.
+     *
+     * <p>Identical in shape to {@link #mapEntriesField}, with the value side pinned to a non-null
+     * INT: a multiset's value is an occurrence count, never user data, so it is neither nullable nor
+     * variable in type.
+     */
+    private static Field multisetEntriesField(String columnName, LogicalType elementType) {
+        requireSupportedMapElement(columnName, "MULTISET element", elementType);
+
+        Field keyField = flinkTypeToArrowField(MapVector.KEY_NAME, elementType);
+        if (keyField.isNullable()) {
+            keyField =
+                    new Field(
+                            MapVector.KEY_NAME,
+                            new FieldType(false, keyField.getType(), null),
+                            keyField.getChildren());
+        }
+        Field countField =
+                new Field(
+                        MapVector.VALUE_NAME,
+                        new FieldType(false, new ArrowType.Int(32, true), null),
+                        null);
+
+        List<Field> entryChildren = new ArrayList<>();
+        entryChildren.add(keyField);
+        entryChildren.add(countField);
+
+        return new Field(
+                MapVector.DATA_VECTOR_NAME,
+                new FieldType(false, ArrowType.Struct.INSTANCE, null),
+                entryChildren);
+    }
+
+    /**
      * Element types the map read/write path can carry.
      *
      * <p>This mirrors what {@code RowDataConverter}'s array element helpers implement, since map
      * keys and values reuse them. It is narrower than the set of types allowed for a top-level
      * column, and widening it means extending those helpers first.
+     *
+     * @param role full description such as {@code "MAP key"} or {@code "MULTISET element"}; it is
+     *     used verbatim so the message matches the DDL the user actually wrote
      */
     private static void requireSupportedMapElement(
             String mapColumnName, String role, LogicalType elementType) {
@@ -393,7 +446,7 @@ public class LanceTypeConverter implements Serializable {
                         || elementType instanceof VarCharType;
         if (!supported) {
             throw new UnsupportedTypeException(
-                    "Unsupported MAP "
+                    "Unsupported "
                             + role
                             + " type for column '"
                             + mapColumnName
@@ -544,6 +597,10 @@ public class LanceTypeConverter implements Serializable {
             DataType valueDataType = toDataType(mapType.getValueType());
             // The key stays NOT NULL to match Arrow, which does not allow a nullable map key.
             return DataTypes.MAP(keyDataType.notNull(), valueDataType);
+        } else if (logicalType instanceof MultisetType) {
+            MultisetType multisetType = (MultisetType) logicalType;
+            // The element becomes the map key, so it carries the same NOT NULL requirement.
+            return DataTypes.MULTISET(toDataType(multisetType.getElementType()).notNull());
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             DataTypes.Field[] fields = rowType.getFields().stream()

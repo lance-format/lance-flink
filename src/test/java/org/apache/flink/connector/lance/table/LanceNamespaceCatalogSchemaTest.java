@@ -167,18 +167,19 @@ class LanceNamespaceCatalogSchemaTest {
     @Test
     @DisplayName("An unsupported column type is rejected as a schema problem")
     void testUnsupportedTypeRejected() {
-        // MULTISET has no Arrow mapping yet. DECIMAL stood in here first, then MAP; each moved on
-        // as it gained a mapping. The assertion is about how an unmappable type is surfaced, not
-        // about MULTISET specifically.
+        // INTERVAL has no Arrow mapping. This case has already moved three times -- DECIMAL, then
+        // MAP, then MULTISET -- because each was a type Lance genuinely stores and so each
+        // eventually gained a mapping. An interval is not analytical storage data, so it is not on
+        // that path and this sample should stop moving.
         CatalogTable table = tableWith(
                 Schema.newBuilder()
-                        .column("tags", DataTypes.MULTISET(DataTypes.STRING()))
+                        .column("gap", DataTypes.INTERVAL(DataTypes.DAY()))
                         .build());
 
         assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
                 .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
                 .hasMessageContaining("Cannot create a Lance table with this schema")
-                .hasMessageContaining("MultisetType");
+                .hasMessageContaining("DayTimeIntervalType");
     }
 
     @Test
@@ -206,6 +207,34 @@ class LanceNamespaceCatalogSchemaTest {
                         .column(
                                 "attrs",
                                 DataTypes.MAP(DataTypes.STRING().notNull(), DataTypes.INT()))
+                        .build());
+
+        assertThatCode(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("A MULTISET declared the obvious way is rejected, because its element is nullable")
+    void testMultisetWithNullableElementRejected() {
+        // Same trap as MAP: DataTypes.MULTISET(DataTypes.STRING()) yields a nullable element, and
+        // the element becomes the Arrow map key, which cannot be nullable.
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("tags", DataTypes.MULTISET(DataTypes.STRING()))
+                        .build());
+
+        assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("tags")
+                .hasMessageContaining("NOT NULL");
+    }
+
+    @Test
+    @DisplayName("A MULTISET with a NOT NULL element is accepted")
+    void testMultisetWithNotNullElementAccepted() {
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("tags", DataTypes.MULTISET(DataTypes.STRING().notNull()))
                         .build());
 
         assertThatCode(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
