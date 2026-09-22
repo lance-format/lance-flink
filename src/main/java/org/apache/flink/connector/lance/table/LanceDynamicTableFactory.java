@@ -196,7 +196,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSource createDynamicTableSource(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateAllowingHadoopOptions(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -211,7 +211,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSink createDynamicTableSink(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateAllowingHadoopOptions(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -259,6 +259,23 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     /**
      * 提取以 {@code hadoop.} 为前缀的选项 key，供 {@code validateExcept} 跳过校验。
      */
+    /**
+     * Validate table options, tolerating the freeform {@code hadoop.*} passthrough keys.
+     *
+     * <p>{@code validateExcept} rejects an empty prefix array outright, so a table that declares no
+     * hadoop option cannot go through that overload at all — which is every table that does not
+     * target HDFS. The prefix list has to be checked before choosing which overload to call.
+     */
+    private void validateAllowingHadoopOptions(
+            FactoryUtil.TableFactoryHelper helper, Map<String, String> tableOptions) {
+        String[] hadoopKeys = extractHadoopOptionKeys(tableOptions);
+        if (hadoopKeys.length == 0) {
+            helper.validate();
+        } else {
+            helper.validateExcept(hadoopKeys);
+        }
+    }
+
     private String[] extractHadoopOptionKeys(Map<String, String> tableOptions) {
         if (tableOptions == null) {
             return new String[0];

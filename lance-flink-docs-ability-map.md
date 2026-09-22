@@ -23,7 +23,7 @@
 | `config.md` | 全部 ConfigOption（读/写/索引/向量/S3/hadoop.*） | — |
 | `operations/ddl/` | CREATE TABLE、CREATE CATALOG、database 操作 | ALTER TABLE、CREATE INDEX、分区 |
 | `operations/dql/` | SELECT（列裁剪/过滤/limit/聚合下推）、向量搜索、时间旅行 | 全文搜索、混合搜索 |
-| `operations/dml/` | INSERT INTO（append）、INSERT OVERWRITE | UPDATE、DELETE、主键/upsert |
+| `operations/dml/` | INSERT INTO（append）、INSERT OVERWRITE、UPDATE、DELETE、主键/upsert | — |
 | `performance.md` | 索引类型、向量调优参数 | benchmark 数据 |
 
 ## 3. 各文件详细内容清单
@@ -99,7 +99,7 @@
 |---|---|---|
 | `INSERT INTO`（append） | ✅ | `write.mode=append`（默认） |
 | `INSERT OVERWRITE` | ✅ | `write.mode=overwrite`（首次写或 overwrite 模式） |
-| `UPDATE` | ❌ | 未实现 |
+| `UPDATE` | ✅ | `SupportsRowLevelUpdate`，`UPDATED_ROWS` 模式经主键 `mergeInsert` upsert；要求声明主键 |
 | `DELETE` | ✅ | 经主键 key-only `mergeInsert` + `withMatchedDelete`（PR #76 + follow-up A4） |
 | 主键 / upsert | ✅ | `PRIMARY KEY NOT ENFORCED` 时声明 `+I/+U/-D`，`keyBy` 保序后走 `mergeInsert` |
 
@@ -117,7 +117,7 @@
 | SQL 语法定位 | 交互式 DDL/DML | 声明式长驻拓扑（CREATE TABLE + INSERT INTO） |
 | vendors | databricks | 无（tbdsfs/hdfs 通过 `hadoop.*` 前缀支撑） |
 | 全文/混合搜索 | ✅ | ❌ |
-| DELETE/UPDATE | ✅ | ❌（进行中） |
+| DELETE/UPDATE | ✅ | ✅（需声明主键） |
 
 ## 5. 建议的文档落地顺序
 

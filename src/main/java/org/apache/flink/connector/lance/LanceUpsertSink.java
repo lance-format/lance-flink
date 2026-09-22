@@ -91,7 +91,8 @@ import java.util.Map;
  * <h3>Consistency model</h3>
  * <p>This sink provides <b>at-least-once</b> semantics, not exactly-once:
  * <ul>
- *   <li>Persistence boundary is the Flink checkpoint (via {@link #snapshotState}). The in-memory
+ *   <li>Persistence boundary is the Flink checkpoint (via {@link #snapshotState}), plus {@link
+ *       #finish()} once the input is exhausted. The in-memory
  *       buffer is <em>not</em> checkpointed; recovery relies on the upstream source being
  *       replayable (Kafka / Debezium / CDC connectors are fine; unbounded non-replayable sources
  *       such as socket/file will lose in-flight rows on TM failure).</li>
@@ -102,7 +103,9 @@ import java.util.Map;
  *   <li>{@code close()} does <b>not</b> flush: Flink invokes {@code close()} on cancellation and
  *       recovery as well, and writing on those paths would violate the "checkpoint is the
  *       persistence boundary" contract. Un-checkpointed rows in the buffer are dropped on close
- *       and will be re-delivered by the source on restart.</li>
+ *       and will be re-delivered by the source on restart. A graceful end-of-input is handled by
+ *       {@code finish()} instead, which Flink calls only on that path; this is what makes a
+ *       bounded or batch job durable, since it never takes a checkpoint.</li>
  * </ul>
  *
  * <h3>Concurrency and first-write</h3>
@@ -464,6 +467,15 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     @Override
     public void initializeState(FunctionInitializationContext context) {
         LOG.debug("Initialize state, isRestored: {}", context.isRestored());
+    }
+
+    @Override
+    public void finish() throws Exception {
+        // Called once the input is exhausted and only on the normal completion path, unlike
+        // close(), which also runs on cancel and failover. A batch job has no checkpoint, so
+        // without this the buffered rows of a keyed write would never reach the dataset.
+        LOG.info("Input finished, flushing remaining {} buffered key(s)", buffer.size());
+        flush();
     }
 
     @Override

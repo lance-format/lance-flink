@@ -25,26 +25,36 @@ import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.table.catalog.Column;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.ProviderContext;
+import org.apache.flink.table.connector.RowLevelModificationScanContext;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.SinkFunctionProvider;
+import org.apache.flink.table.connector.sink.abilities.SupportsRowLevelUpdate;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
 
+import javax.annotation.Nullable;
+
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Lance dynamic table sink.
  * 
  * <p>Implements DynamicTableSink interface, supports writing Flink data to Lance dataset.
+ *
+ * <p>With a primary key declared, the sink also serves {@code UPDATE} through {@link
+ * SupportsRowLevelUpdate}. The statement is answered by the same keyed upsert path used for
+ * streaming writes, because Lance's {@code mergeInsert} already expresses match-by-key-then-update.
  */
-public class LanceDynamicTableSink implements DynamicTableSink {
+public class LanceDynamicTableSink implements DynamicTableSink, SupportsRowLevelUpdate {
 
     private final LanceOptions options;
     private final DataType physicalDataType;
@@ -123,6 +133,37 @@ public class LanceDynamicTableSink implements DynamicTableSink {
     @Override
     public DynamicTableSink copy() {
         return new LanceDynamicTableSink(options, physicalDataType, primaryKeys, primaryKeyIndices);
+    }
+
+    @Override
+    public RowLevelUpdateInfo applyRowLevelUpdate(
+            List<Column> updatedColumns, @Nullable RowLevelModificationScanContext context) {
+        if (primaryKeys.isEmpty()) {
+            // Without a key there is nothing for mergeInsert to match on, so an update could only
+            // be served by rewriting the table. Fail during planning rather than at runtime.
+            throw new UnsupportedOperationException(
+                    "UPDATE requires a PRIMARY KEY NOT ENFORCED on the Lance table. "
+                            + "The table is append-only without one; "
+                            + "declare a primary key to enable row-level updates.");
+        }
+
+        return new RowLevelUpdateInfo() {
+            @Override
+            public Optional<List<Column>> requiredColumns() {
+                // Empty means "every column, in table order". The sink writes the full row through
+                // mergeInsert(withMatchedUpdateAll), so a projection limited to the SET list plus
+                // the key would null out every column the statement did not mention.
+                return Optional.empty();
+            }
+
+            @Override
+            public RowLevelUpdateMode getRowLevelUpdateMode() {
+                // UPDATED_ROWS delivers only the matched rows, each tagged UPDATE_AFTER, which is
+                // what the keyed upsert path already consumes. ALL_ROWS would stream back rows the
+                // statement did not touch and rewrite them for no gain.
+                return RowLevelUpdateMode.UPDATED_ROWS;
+            }
+        };
     }
 
     @Override
