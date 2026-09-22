@@ -41,6 +41,32 @@ schema at `CREATE TABLE` on any version, but writing rows fails inside the Lance
 encoder below 2.2 — so set the option at table creation, not after the first
 write attempt.
 
+### MAP columns
+
+A `MAP` column requires `write.data-storage-version` to be `2.2` or newer.
+`CREATE TABLE` fails fast if the option is set to something older, naming the
+column. If the option is unset the connector only logs a warning, since the
+effective default belongs to the Lance SDK.
+
+Two constraints apply to the key and value types:
+
+```sql
+-- Rejected: DataTypes.MAP(STRING(), INT()) yields a nullable key, and Arrow
+-- does not allow one.
+CREATE TABLE t (attrs MAP<STRING, INT>) WITH (...);
+
+-- Correct: the key is declared NOT NULL.
+CREATE TABLE t (attrs MAP<STRING NOT NULL, INT>) WITH (
+  'write.data-storage-version' = '2.2', ...
+);
+```
+
+Keys and values support `INT`, `BIGINT`, `FLOAT`, `DOUBLE` and `STRING`. This is
+narrower than what a top-level column accepts — the same limit applies to
+`ARRAY` elements — and a type outside it is rejected at `CREATE TABLE` rather
+than on the first write. An empty map and a `NULL` map are stored distinctly. A
+`NULL` value is allowed; a `NULL` key is not.
+
 ### Vector index
 
 | Option | Required | Default | Description |

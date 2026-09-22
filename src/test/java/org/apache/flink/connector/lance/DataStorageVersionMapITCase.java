@@ -266,4 +266,90 @@ class DataStorageVersionMapITCase {
             return ds.getLanceFileFormatVersion();
         }
     }
+
+    @Test
+    @DisplayName("CREATE TABLE with a MAP column on a pre-2.2 version fails before the table exists")
+    void mapColumnOnOldVersionIsRejectedAtDdlTime() throws Exception {
+        // Without this check the schema is accepted, the table is materialized, and the user only
+        // finds out on the first write via a Rust-level encoder message that names neither the
+        // table nor the option to set.
+        org.apache.flink.connector.lance.table.LanceCatalog catalog =
+                new org.apache.flink.connector.lance.table.LanceCatalog(
+                        "lance", "default", tempDir.toString());
+        catalog.open();
+        try {
+            catalog.createDatabase("db", null, false);
+
+            java.util.Map<String, String> options = new java.util.HashMap<>();
+            options.put("write.data-storage-version", "2.1");
+
+            org.apache.flink.table.catalog.ObjectPath tablePath =
+                    new org.apache.flink.table.catalog.ObjectPath("db", "bad_map");
+            org.apache.flink.table.catalog.CatalogTable table =
+                    org.apache.flink.table.catalog.CatalogTable.of(
+                            org.apache.flink.table.api.Schema.newBuilder()
+                                    .column("id", org.apache.flink.table.api.DataTypes.INT())
+                                    .column(
+                                            "attrs",
+                                            org.apache.flink.table.api.DataTypes.MAP(
+                                                    org.apache.flink.table.api.DataTypes.STRING()
+                                                            .notNull(),
+                                                    org.apache.flink.table.api.DataTypes.INT()))
+                                    .build(),
+                            "",
+                            Collections.emptyList(),
+                            options);
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(
+                            () -> catalog.createTable(tablePath, table, false))
+                    .hasMessageContaining("attrs")
+                    .hasMessageContaining("2.2");
+
+            // The failure must come before materialization, otherwise a half-created table is left
+            // behind for the next CREATE to trip over.
+            assertThat(catalog.tableExists(tablePath))
+                    .as("the table must not be left behind after a rejected CREATE")
+                    .isFalse();
+        } finally {
+            catalog.close();
+        }
+    }
+
+    @Test
+    @DisplayName("CREATE TABLE with a MAP column on 2.2 is accepted")
+    void mapColumnOn22IsAccepted() throws Exception {
+        org.apache.flink.connector.lance.table.LanceCatalog catalog =
+                new org.apache.flink.connector.lance.table.LanceCatalog(
+                        "lance", "default", tempDir.toString());
+        catalog.open();
+        try {
+            catalog.createDatabase("db", null, false);
+
+            java.util.Map<String, String> options = new java.util.HashMap<>();
+            options.put("write.data-storage-version", "2.2");
+
+            org.apache.flink.table.catalog.ObjectPath tablePath =
+                    new org.apache.flink.table.catalog.ObjectPath("db", "good_map");
+            catalog.createTable(
+                    tablePath,
+                    org.apache.flink.table.catalog.CatalogTable.of(
+                            org.apache.flink.table.api.Schema.newBuilder()
+                                    .column("id", org.apache.flink.table.api.DataTypes.INT())
+                                    .column(
+                                            "attrs",
+                                            org.apache.flink.table.api.DataTypes.MAP(
+                                                    org.apache.flink.table.api.DataTypes.STRING()
+                                                            .notNull(),
+                                                    org.apache.flink.table.api.DataTypes.INT()))
+                                    .build(),
+                            "",
+                            Collections.emptyList(),
+                            options),
+                    false);
+
+            assertThat(catalog.tableExists(tablePath)).isTrue();
+        } finally {
+            catalog.close();
+        }
+    }
 }

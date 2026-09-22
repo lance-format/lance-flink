@@ -601,6 +601,7 @@ public class LanceCatalog extends AbstractCatalog {
         if (storageVersion != null && !storageVersion.trim().isEmpty()) {
             createParams.withDataStorageVersion(storageVersion.trim());
         }
+        rejectMapColumnsOnUnsupportedVersion(arrowSchema, storageVersion, tablePath);
         try (Dataset dataset = Dataset.create(
                 allocator, datasetPath, arrowSchema, createParams.build())) {
             PrimaryKeyPersistence.persist(dataset, primaryKeys);
@@ -614,6 +615,94 @@ public class LanceCatalog extends AbstractCatalog {
         }
 
         LOG.info("Created table: {} (primary keys: {})", tablePath, primaryKeys);
+    }
+
+    /**
+     * Fail early when a MAP column is created on a dataset format that cannot hold one.
+     *
+     * <p>Lance accepts a map into the schema on any version and only rejects it when the first row
+     * is written, deep in the Rust encoder. Catching it here means the error names the table and
+     * the option to set.
+     *
+     * <p>An unset version is only warned about, not rejected: the effective default belongs to the
+     * SDK, so refusing here would break the moment that default moves to 2.2 or later.
+     */
+    private void rejectMapColumnsOnUnsupportedVersion(
+            org.apache.arrow.vector.types.pojo.Schema arrowSchema,
+            String storageVersion,
+            ObjectPath tablePath) {
+        List<String> mapColumns = new ArrayList<>();
+        for (org.apache.arrow.vector.types.pojo.Field field : arrowSchema.getFields()) {
+            if (containsMap(field)) {
+                mapColumns.add(field.getName());
+            }
+        }
+        if (mapColumns.isEmpty()) {
+            return;
+        }
+
+        String configured = storageVersion == null ? null : storageVersion.trim();
+        if (configured == null || configured.isEmpty()) {
+            LOG.warn(
+                    "Table {} declares MAP column(s) {} without {}. MAP data requires Lance format "
+                            + "2.2+; if the SDK default is older the first write will fail in the "
+                            + "encoder.",
+                    tablePath.getFullName(),
+                    mapColumns,
+                    LanceOptions.WRITE_DATA_STORAGE_VERSION.key());
+            return;
+        }
+
+        if (isBelow22(configured)) {
+            throw new CatalogException(
+                    "Table "
+                            + tablePath.getFullName()
+                            + " declares MAP column(s) "
+                            + mapColumns
+                            + " but "
+                            + LanceOptions.WRITE_DATA_STORAGE_VERSION.key()
+                            + " is '"
+                            + configured
+                            + "'. MAP data requires Lance format 2.2 or newer; the schema would be "
+                            + "accepted here and the first write would then fail in the encoder.");
+        }
+    }
+
+    /** Whether a field is a map, or transitively contains one. */
+    private static boolean containsMap(org.apache.arrow.vector.types.pojo.Field field) {
+        if (field.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Map) {
+            return true;
+        }
+        List<org.apache.arrow.vector.types.pojo.Field> children = field.getChildren();
+        if (children == null) {
+            return false;
+        }
+        for (org.apache.arrow.vector.types.pojo.Field child : children) {
+            if (containsMap(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Compare a {@code major.minor} version string against 2.2.
+     *
+     * <p>Anything unparseable is treated as new enough, so an alias such as {@code stable} is left
+     * for Lance to accept or reject rather than guessed at here.
+     */
+    private static boolean isBelow22(String version) {
+        String[] parts = version.split("\\.");
+        if (parts.length < 2) {
+            return false;
+        }
+        try {
+            int major = Integer.parseInt(parts[0].trim());
+            int minor = Integer.parseInt(parts[1].trim());
+            return major < 2 || (major == 2 && minor < 2);
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     /**

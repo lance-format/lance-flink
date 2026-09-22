@@ -20,6 +20,8 @@ package org.apache.flink.connector.lance.converter;
 
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericMapData;
+import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.GenericArrayData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -36,6 +38,7 @@ import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimeType;
@@ -85,6 +88,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 
 /**
@@ -225,6 +230,8 @@ public class RowDataConverter implements Serializable {
                     value, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return readArray(vector, index, (ArrayType) logicalType);
+        } else if (logicalType instanceof MapType) {
+            return readMap(vector, index, (MapType) logicalType);
         } else if (logicalType instanceof RowType) {
             return readStruct(vector, index, (RowType) logicalType);
         }
@@ -330,6 +337,64 @@ public class RowDataConverter implements Serializable {
 
         throw new LanceTypeConverter.UnsupportedTypeException(
                 "Unsupported array Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
+     * Read map value.
+     *
+     * <p>An Arrow map is a list of non-nullable {@code entries} structs, each holding a {@code key}
+     * and a {@code value} child. The offsets come from the enclosing list, so the key and value
+     * slices are read from the same index range.
+     */
+    private MapData readMap(FieldVector vector, int index, MapType mapType) {
+        if (!(vector instanceof MapVector)) {
+            // Note this cannot be relaxed to ListVector: a plain list carries no key child, and
+            // treating one as a map would read garbage out of the element vector.
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported map Vector type: " + vector.getClass().getSimpleName());
+        }
+
+        MapVector mapVector = (MapVector) vector;
+        int startIndex = mapVector.getElementStartIndex(index);
+        int endIndex = mapVector.getElementEndIndex(index);
+        int size = endIndex - startIndex;
+
+        StructVector entries = (StructVector) mapVector.getDataVector();
+        FieldVector keyVector = entries.getChild(MapVector.KEY_NAME);
+        FieldVector valueVector = entries.getChild(MapVector.VALUE_NAME);
+        if (keyVector == null || valueVector == null) {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Map entries struct must expose '" + MapVector.KEY_NAME + "' and '"
+                            + MapVector.VALUE_NAME + "' children");
+        }
+
+        ArrayData keys = readArrayData(keyVector, startIndex, size, mapType.getKeyType());
+        ArrayData values = readArrayData(valueVector, startIndex, size, mapType.getValueType());
+        return new GenericMapData(toJavaMap(keys, values, mapType));
+    }
+
+    /**
+     * Materialize key/value slices into the map {@link GenericMapData} expects.
+     *
+     * <p>Duplicate keys collapse to the last occurrence, matching how Flink's own map
+     * implementations behave when a duplicate reaches them.
+     */
+    private Map<Object, Object> toJavaMap(ArrayData keys, ArrayData values, MapType mapType) {
+        Map<Object, Object> result = new LinkedHashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            Object key = elementAt(keys, i, mapType.getKeyType());
+            Object value = elementAt(values, i, mapType.getValueType());
+            result.put(key, value);
+        }
+        return result;
+    }
+
+    /** Extract one element out of an {@link ArrayData} as the object GenericMapData stores. */
+    private Object elementAt(ArrayData array, int i, LogicalType elementType) {
+        if (array.isNullAt(i)) {
+            return null;
+        }
+        return ArrayData.createElementGetter(elementType).getElementOrNull(array, i);
     }
 
     /**
@@ -460,6 +525,8 @@ public class RowDataConverter implements Serializable {
             return rowData.getDecimal(index, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return rowData.getArray(index);
+        } else if (logicalType instanceof MapType) {
+            return rowData.getMap(index);
         } else if (logicalType instanceof RowType) {
             RowType nestedRowType = (RowType) logicalType;
             return rowData.getRow(index, nestedRowType.getFieldCount());
@@ -511,6 +578,8 @@ public class RowDataConverter implements Serializable {
             ((DecimalVector) vector).setSafe(index, ((DecimalData) value).toBigDecimal());
         } else if (logicalType instanceof ArrayType) {
             writeArray(vector, index, (ArrayData) value, (ArrayType) logicalType);
+        } else if (logicalType instanceof MapType) {
+            writeMap(vector, index, (MapData) value, (MapType) logicalType);
         } else if (logicalType instanceof RowType) {
             writeStruct(vector, index, (RowData) value, (RowType) logicalType);
         } else {
@@ -697,6 +766,53 @@ public class RowDataConverter implements Serializable {
             throw new LanceTypeConverter.UnsupportedTypeException(
                     "Unsupported array Vector type: " + vector.getClass().getSimpleName());
         }
+    }
+
+    /**
+     * Write map value.
+     *
+     * <p>Mirrors {@link #writeArray}'s list handling for the offsets, with two additions specific
+     * to maps: each {@code entries} slot has to be marked defined or the struct reads back as NULL
+     * even though key and value were written, and a NULL key is rejected because Arrow does not
+     * allow one.
+     */
+    private void writeMap(FieldVector vector, int index, MapData mapData, MapType mapType) {
+        if (!(vector instanceof MapVector)) {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported map Vector type: " + vector.getClass().getSimpleName());
+        }
+
+        MapVector mapVector = (MapVector) vector;
+        ArrayData keys = mapData.keyArray();
+        ArrayData values = mapData.valueArray();
+        int size = mapData.size();
+
+        for (int i = 0; i < size; i++) {
+            if (keys.isNullAt(i)) {
+                throw new IllegalArgumentException(
+                        "MAP key must not be NULL: Arrow map keys are non-nullable, so a NULL key "
+                                + "cannot be written (entry " + i + ")");
+            }
+        }
+
+        mapVector.startNewValue(index);
+
+        StructVector entries = (StructVector) mapVector.getDataVector();
+        FieldVector keyVector = entries.getChild(MapVector.KEY_NAME);
+        FieldVector valueVector = entries.getChild(MapVector.VALUE_NAME);
+        int startIndex = mapVector.getElementStartIndex(index);
+
+        writeArrayData(keyVector, startIndex, keys, mapType.getKeyType());
+        writeArrayData(valueVector, startIndex, values, mapType.getValueType());
+
+        // Without this the entries struct keeps a zero validity bit and the whole entry reads back
+        // as NULL, which looks like data loss rather than a missing flag.
+        for (int i = 0; i < size; i++) {
+            entries.setIndexDefined(startIndex + i);
+        }
+        entries.setValueCount(startIndex + size);
+
+        mapVector.endValue(index, size);
     }
 
     /**

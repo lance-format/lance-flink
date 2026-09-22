@@ -31,6 +31,7 @@ import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimeType;
@@ -42,6 +43,7 @@ import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -193,6 +195,26 @@ public class LanceTypeConverter implements Serializable {
                 return new ArrayType(nullable, elementType);
             }
             throw new UnsupportedTypeException("FixedSizeList must contain child type");
+        } else if (arrowType instanceof ArrowType.Map) {
+            // Must precede the List branch. An Arrow map is physically a list of entry structs, so
+            // a List-first check would map it to ARRAY<ROW<key, value>> and the column would stop
+            // round-tripping as a MAP.
+            List<Field> children = field.getChildren();
+            if (children == null || children.isEmpty()) {
+                throw new UnsupportedTypeException("Map must contain an entries child");
+            }
+            Field entries = children.get(0);
+            List<Field> keyValue = entries.getChildren();
+            if (keyValue == null || keyValue.size() != 2) {
+                throw new UnsupportedTypeException(
+                        "Map entries must contain exactly key and value children, found "
+                                + (keyValue == null ? 0 : keyValue.size()));
+            }
+            LogicalType keyType = arrowTypeToFlinkType(keyValue.get(0));
+            LogicalType valueType = arrowTypeToFlinkType(keyValue.get(1));
+            // Arrow guarantees a non-null key; carry that through so a round-trip does not hand
+            // back a MAP the converter would then refuse on the way in.
+            return new MapType(nullable, keyType.copy(false), valueType);
         } else if (arrowType instanceof ArrowType.List || arrowType instanceof ArrowType.LargeList) {
             // Regular list type
             List<Field> children = field.getChildren();
@@ -282,6 +304,22 @@ public class LanceTypeConverter implements Serializable {
             children.add(childField);
             // For vector types, use List type
             arrowType = ArrowType.List.INSTANCE;
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            LogicalType keyType = mapType.getKeyType();
+            // Arrow requires map keys to be non-null, while Flink's MapType allows a nullable key
+            // type. Silently widening it would let a NULL key reach the encoder, so reject it here
+            // where the message can still name the offending column.
+            if (keyType.isNullable()) {
+                throw new UnsupportedTypeException(
+                        "MAP key must be NOT NULL for column '" + name + "': Arrow map keys cannot "
+                                + "be nullable. Declare the key as e.g. MAP<STRING NOT NULL, INT>.");
+            }
+            children = new ArrayList<>();
+            children.add(mapEntriesField(name, keyType, mapType.getValueType()));
+            // keysSorted=false: nothing in the write path sorts entries, and claiming otherwise
+            // would let a reader skip its own ordering work on unordered data.
+            arrowType = new ArrowType.Map(false);
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             children = new ArrayList<>();
@@ -299,7 +337,76 @@ public class LanceTypeConverter implements Serializable {
     }
 
     /**
-     * Create vector field (FixedSizeList<Float32>)
+     * Build the {@code entries} struct that backs an Arrow map field.
+     *
+     * <p>Arrow fixes both the names and the nullability here: the struct is called {@code entries}
+     * and must itself be non-nullable, and {@code key} must be non-nullable. Only {@code value} may
+     * be null. Getting any of that wrong surfaces later as an opaque IPC or encoder error, so the
+     * names come from {@link MapVector}'s constants rather than string literals -- note that
+     * {@code MapVector.DATA_VECTOR_NAME} is {@code entries}, whereas the inherited
+     * {@code BaseRepeatedValueVector.DATA_VECTOR_NAME} is {@code $data$}.
+     */
+    private static Field mapEntriesField(
+            String mapColumnName, LogicalType keyType, LogicalType valueType) {
+        // Arrow accepts far more element types here than the read/write path can actually move, so
+        // an unchecked MAP<STRING, DATE> would create a table whose first write fails deep in the
+        // converter. Reject it at DDL time instead, where the message can name the column.
+        requireSupportedMapElement(mapColumnName, "key", keyType);
+        requireSupportedMapElement(mapColumnName, "value", valueType);
+
+        Field keyField = flinkTypeToArrowField(MapVector.KEY_NAME, keyType);
+        if (keyField.isNullable()) {
+            // Defensive: the caller already rejects a nullable key type, but a converter that
+            // widened nullability on the way out would otherwise produce a schema Arrow refuses.
+            keyField =
+                    new Field(
+                            MapVector.KEY_NAME,
+                            new FieldType(false, keyField.getType(), null),
+                            keyField.getChildren());
+        }
+        Field valueField = flinkTypeToArrowField(MapVector.VALUE_NAME, valueType);
+
+        List<Field> entryChildren = new ArrayList<>();
+        entryChildren.add(keyField);
+        entryChildren.add(valueField);
+
+        return new Field(
+                MapVector.DATA_VECTOR_NAME,
+                new FieldType(false, ArrowType.Struct.INSTANCE, null),
+                entryChildren);
+    }
+
+    /**
+     * Element types the map read/write path can carry.
+     *
+     * <p>This mirrors what {@code RowDataConverter}'s array element helpers implement, since map
+     * keys and values reuse them. It is narrower than the set of types allowed for a top-level
+     * column, and widening it means extending those helpers first.
+     */
+    private static void requireSupportedMapElement(
+            String mapColumnName, String role, LogicalType elementType) {
+        boolean supported =
+                elementType instanceof IntType
+                        || elementType instanceof BigIntType
+                        || elementType instanceof FloatType
+                        || elementType instanceof DoubleType
+                        || elementType instanceof VarCharType;
+        if (!supported) {
+            throw new UnsupportedTypeException(
+                    "Unsupported MAP "
+                            + role
+                            + " type for column '"
+                            + mapColumnName
+                            + "': "
+                            + elementType.getClass().getSimpleName()
+                            + ". MAP keys and values support INT, BIGINT, FLOAT, DOUBLE and STRING. "
+                            + "Arrow would accept more, but the connector's map read/write path "
+                            + "would then fail on the first write rather than here.");
+        }
+    }
+
+    /**
+     * Create vector field (FixedSizeList&lt;Float32&gt;)
      *
      * @param name Field name
      * @param dimension Vector dimension
@@ -431,6 +538,12 @@ public class LanceTypeConverter implements Serializable {
             ArrayType arrayType = (ArrayType) logicalType;
             DataType elementDataType = toDataType(arrayType.getElementType());
             return DataTypes.ARRAY(elementDataType);
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            DataType keyDataType = toDataType(mapType.getKeyType());
+            DataType valueDataType = toDataType(mapType.getValueType());
+            // The key stays NOT NULL to match Arrow, which does not allow a nullable map key.
+            return DataTypes.MAP(keyDataType.notNull(), valueDataType);
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             DataTypes.Field[] fields = rowType.getFields().stream()

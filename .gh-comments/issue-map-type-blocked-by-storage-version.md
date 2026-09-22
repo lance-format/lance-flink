@@ -58,10 +58,37 @@ schema 也无损：`Map(false)<entries: Struct<key: Utf8 not null, value: Int(32
 `Dataset#getLanceFileFormatVersion()` 对比「显式 2.2」与「未设置」两张表，并实测禁用后
 该用例失败。
 
-**主体项：MAP 类型映射** —— 待做
+**主体项：MAP 类型映射** —— 已完成
 
-前置项已就位，可以开始。落地时必须在 `flinkTypeToArrowField` 遇到 MAP 而存储版本 < 2.2
-时给出明确报错，而不是让用户在写入时撞 Rust 层的错。
+三个转换方向（`flinkTypeToArrowField`、`arrowTypeToFlinkType`、`toDataType`）与
+`RowDataConverter` 的四个分派点全部接入。
+
+`LanceCatalog#createTable` 在检测到 MAP 列而 `write.data-storage-version` 明确低于 2.2 时
+直接拒绝，错误信息点名列与选项。版本**未设置**时只告警不拦截——有效默认归 SDK 所有，硬拦
+截会在 SDK 默认前移到 2.2 后误伤合法用法。
+
+## 实测确认的三件事
+
+**`setIndexDefined` 是必需的，不是保险。** 移除后纯内存的 `RowDataConverter` 往返测试依然
+全绿，因为它读回自己写的向量、从不经过 Lance 校验；但真实数据集立刻报
+`The field \`entries\` contained null values even though the field is marked non-null in the
+schema`（`lance-file/src/writer.rs:397`）。这说明这两层测试缺一不可，内存层对非空约束没有
+判别力。
+
+**写路径的 MapVector 前置分支同样必需。** 禁用 MAP 写分派后落进 `ListVector` 分支，报
+`Unsupported write type: MapType`。读路径同理——`ArrowType.Map` 必须在 `ArrowType.List`
+之前判断，否则 map 会退化成 `ARRAY<ROW<key, value>>` 且不再往返。
+
+**key/value 的类型范围远窄于顶层列。** 只支持 INT/BIGINT/FLOAT/DOUBLE/STRING，受
+`RowDataConverter` 的 `readArrayData`/`writeArrayData` 限制（ARRAY 元素同此约束）。
+`MAP<STRING, DATE>` 在 Arrow 层完全合法、建表会放行，但首次写入必失败——与 MAP 本身踩的
+是同一个坑，因此在 `mapEntriesField` 里提前拒绝。要放宽得先扩那两个 helper。
+
+## 用户侧易踩点
+
+`DataTypes.MAP(STRING(), INT())` 的 key 默认可空，而 Arrow 不允许可空 key，所以最自然的
+写法会被拒绝。正确写法是 `DataTypes.MAP(DataTypes.STRING().notNull(), DataTypes.INT())`。
+错误信息显式说明了这一点。
 
 ## 过程中另外发现的问题
 
@@ -73,8 +100,12 @@ schema 也无损：`Map(false)<entries: Struct<key: Utf8 not null, value: Int(32
 `read.*`、`index.*`、`vector.*` 等）。这是 A7「双份真相」在另一处的同类复发，规模更大。
 本次按既有模式在两处都加了新选项以保持一致，未夹带重构——独立处理更安全。
 
+**「不支持类型」的测试样本第三次搬家。** `LanceNamespaceCatalogSchemaTest` 里这个用例先用
+DECIMAL、后用 MAP，两者各自获得映射后都得换；现已改用 `MULTISET`。这类测试天生会随能力
+扩张而失效，注释里记了迁移史以便下次直接换。
+
 ## 未验证项
 
 - 2.1 与 2.2 数据集能否在同一路径混用（时间旅行读旧版本）。
 - 2.2 是否影响其他类型的编码或既有索引。
-- `MULTISET`（Flink 侧是 `Map<T, Integer>`）是否同样受 2.2 限制——推测受同样限制，未实测。
+- `MULTISET`（Flink 侧是 `Map<T, Integer>`）仍无映射，推测同受 2.2 限制，未实测。

@@ -44,6 +44,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -166,9 +167,26 @@ class LanceNamespaceCatalogSchemaTest {
     @Test
     @DisplayName("An unsupported column type is rejected as a schema problem")
     void testUnsupportedTypeRejected() {
-        // MAP has no Arrow mapping yet. DECIMAL used to stand in here, so this case had to move
-        // when DECIMAL gained one; the assertion is about how an unmappable type is surfaced, not
-        // about MAP specifically.
+        // MULTISET has no Arrow mapping yet. DECIMAL stood in here first, then MAP; each moved on
+        // as it gained a mapping. The assertion is about how an unmappable type is surfaced, not
+        // about MULTISET specifically.
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("tags", DataTypes.MULTISET(DataTypes.STRING()))
+                        .build());
+
+        assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("Cannot create a Lance table with this schema")
+                .hasMessageContaining("MultisetType");
+    }
+
+    @Test
+    @DisplayName("A MAP declared the obvious way is rejected, because its key is nullable")
+    void testMapWithNullableKeyRejected() {
+        // DataTypes.MAP(STRING(), INT()) produces a nullable key, which is the natural thing to
+        // write and which Arrow does not allow. The message has to say so explicitly, otherwise
+        // the user has no way to know that .notNull() on the key is what is missing.
         CatalogTable table = tableWith(
                 Schema.newBuilder()
                         .column("attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()))
@@ -176,8 +194,22 @@ class LanceNamespaceCatalogSchemaTest {
 
         assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
                 .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
-                .hasMessageContaining("Cannot create a Lance table with this schema")
-                .hasMessageContaining("MapType");
+                .hasMessageContaining("attrs")
+                .hasMessageContaining("NOT NULL");
+    }
+
+    @Test
+    @DisplayName("A MAP with a NOT NULL key is accepted")
+    void testMapWithNotNullKeyAccepted() {
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column(
+                                "attrs",
+                                DataTypes.MAP(DataTypes.STRING().notNull(), DataTypes.INT()))
+                        .build());
+
+        assertThatCode(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .doesNotThrowAnyException();
     }
 
     @Test
