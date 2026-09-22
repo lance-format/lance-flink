@@ -207,7 +207,8 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
         // Open-or-create: atomic in the Lance native layer, safe under concurrent first-writes.
         this.dataset = openOrCreate(datasetPath);
 
-        // Persist the primary keys into the dataset config. Idempotent; safe to call on every open.
+        // Persist the primary keys into the dataset config. Tolerates a peer subtask committing
+        // the same value concurrently; see PrimaryKeyPersistence#persist.
         PrimaryKeyPersistence.persist(dataset, primaryKeys);
 
         LOG.info("Lance Upsert Sink opened, primary keys: {}", primaryKeys);

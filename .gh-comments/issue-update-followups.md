@@ -1,77 +1,67 @@
-# 本轮（UPDATE 实现）过程中暴露的既有缺陷
+# UPDATE 实现过程中暴露的既有缺陷（已解决）
 
-这两项都不是 `UPDATE` 引入的，也不在其修复范围内。它们是实现 `UPDATE` 时因首次有端到端
-SQL 测试覆盖而暴露出来的既有问题，单独记录以免随实现一起被淡化。
-
----
-
-## C1：`*ITCase` 测试在 `mvn test` 中从未被执行
-
-**现象**
-
-surefire 默认只匹配 `*Test` / `Test*` / `*Tests` / `*TestCase`，`*ITCase` 不在其中，
-而项目未配置 failsafe 插件、也未自定义 `<includes>`。因此以下测试类从未在全量构建中运行：
-
-```
-LanceUpsertSinkITCase          9 个用例（含 1 个长期失败，见 C2）
-LanceCatalogTableChangeITCase  8
-LanceNamespaceCatalogITCase    ...
-LanceCatalogTableITCase        ...
-LanceTimeTravelITCase          4
-LanceSinkConcurrencyITCase     1
-CompositePkDeleteITCase        1
-```
-
-单独执行 `-Dtest='*ITCase'` 时共 86 个用例。
-
-**影响**
-
-此前多轮报告的「全量 N 个测试通过」均未包含这 86 个用例，其中含一个真实失败。
-A6 的 `LanceCatalogTableChangeITCase` 等验收测试实际上从未在全量回归中生效。
-
-**处置**
-
-本轮新增的两个测试类已命名为 `*Test` 以确保执行。既有 ITCase 未改名，因为重命名会
-影响 CI 中可能存在的分阶段执行约定（如故意把集成测试留给单独的 job）。
-
-**待决策**
-
-需要确认 CI 是否另有 `-Dtest='*ITCase'` 阶段。若没有，应二者择一：
-配置 failsafe 并绑定 `verify`，或把 ITCase 纳入 surefire 的 `<includes>`。
-在此之前，「全量通过」的说法应明确排除 ITCase。
+这两项都不是 `UPDATE` 引入的。它们是实现 `UPDATE` 时因首次有端到端 SQL 测试覆盖而暴露
+出来的既有问题，均已在本轮修复。保留本文件作为背景记录。
 
 ---
 
-## C2：两个 subtask 并发首写时主键元数据提交冲突
+## C1：`*ITCase` 测试在构建中从未被执行 —— 已修复
 
-**现象**
+**曾经的现象**
 
-`LanceUpsertSinkITCase#twoSubtasksConcurrentFirstWrite` 长期失败：
+surefire 的默认 includes 不匹配 `*ITCase` 后缀，而项目未配置 failsafe 插件。CI 跑的是
+`mvn verify`，但 `verify` 阶段的插件链里只有 surefire，没有任何 failsafe，因此 75 个
+集成测试从未在构建中运行——CI 每次"通过"都不包含它们，其中还藏着一个真实失败（见 C2）。
+
+**修复**
+
+在 `pom.xml` 的 pluginManagement 声明 `maven-failsafe-plugin`（3.3.0，因内部镜像无 3.1.2），
+并在 build/plugins 绑定 `integration-test` + `verify` 两个 goal。verify goal 是关键：
+没有它，报告会生成但构建仍然通过。
+
+failsafe 默认 includes 含 `**/*ITCase.java`，正好匹配项目约定，无需自定义。既有 ITCase
+未改名，保留 Flink 生态的标准命名。
+
+**验证**
+
+`mvn verify` 现在每模块执行 surefire 276 + failsafe 75，三个 Flink 版本模块全绿。
+移除 verify goal 曾确认失败的集成测试不会中断构建，加回后恢复拦截。
+
+---
+
+## C2：两个 subtask 并发首写时主键元数据提交冲突 —— 已修复
+
+**曾经的现象**
+
+`LanceUpsertSinkITCase#twoSubtasksConcurrentFirstWrite` 失败：
 
 ```
 RuntimeException: Incompatible transaction: This UpdateConfig transaction is
 incompatible with concurrent transaction UpdateConfig at version 2.
-  at PrimaryKeyPersistence.persist(PrimaryKeyPersistence.java:73)
-  at LanceUpsertSink.open(LanceUpsertSink.java:211)
+  at PrimaryKeyPersistence.persist(...)
+  at LanceUpsertSink.open(...)
 ```
-
-已确认为既有缺陷：在本轮改动前的提交上 stash 验证，同样失败。
 
 **成因**
 
-`LanceUpsertSink.open()` 对首写执行 open-or-create，随后每个 subtask 都调用
-`PrimaryKeyPersistence.persist` 写入主键元数据。该写入是一个 `UpdateConfig` 事务，
-多个 subtask 并发提交时 Lance 的冲突解析器直接拒绝，而非合并。
+`PrimaryKeyPersistence.persist` 无条件调用 `dataset.updateConfig` 写主键元数据。该调用
+是一个版本化的 Lance 事务，不是幂等 put；多个 subtask 并发首写时同时提交，Lance 的冲突
+解析器直接拒绝而非合并。原注释"Idempotent; safe to call on every open"是错误假设。
 
-**影响**
+**修复**
 
-并行度 > 1 的表在首次写入时可能整体失败。dataset 已存在时不受影响，
-因此在先建表再写入的流程中不易触发。
+让 `persist` 真正幂等，两道防线：
 
-**候选方向**
+1. 写入前先比较——值已一致则完全不发起事务，稳态零写入；
+2. 冲突时先 `dataset.checkoutLatest()` 把句柄推进到最新版本（`getConfig` 读的是 open 时
+   的旧快照，不推进就永远看不到对端提交），再重读校验；若目标值已达成则视为成功，
+   否则照常抛出。
 
-- 仅由 subtask 0 写元数据，其余 subtask 跳过
-- `persist` 捕获冲突异常后重读校验，若目标值已一致则视为成功
-- 把主键元数据的写入前移到 catalog 建表阶段，使 sink 的 open 不再写 config
+第 2 步的句柄推进是关键：移除它测试立即复现原冲突，证明句柄陈旧才是根因。冲突异常是
+Rust 层的裸 `RuntimeException` 无专用类型，因此用重读校验结果而非匹配消息来判断。
 
-需要先确认 Lance 是否为 `UpdateConfig` 提供幂等或可重试的提交语义，再选方案。
+**验证**
+
+`twoSubtasksConcurrentFirstWrite` 连续 3 次稳定通过；移除 `checkoutLatest` 立即复现原
+冲突（证明测试与诊断有效）。另加 `PrimaryKeyPersistenceConcurrencyTest`（5 个单元用例），
+其中一条专门钉住"容错不得吞掉真实分歧"——不同的 key list 仍必须写入。

@@ -50,6 +50,15 @@ public final class PrimaryKeyPersistence {
     /**
      * Persist the primary-key column names into the dataset config.
      *
+     * <p>Safe to call concurrently from several subtasks opening the same dataset. {@code
+     * updateConfig} is a versioned Lance transaction rather than an idempotent put, so two
+     * subtasks committing it at the same time are rejected outright by the conflict resolver
+     * ("Incompatible transaction: This UpdateConfig transaction is incompatible with concurrent
+     * transaction UpdateConfig"). Two things keep that from surfacing: the value is compared
+     * first so that the steady state issues no transaction at all, and a losing commit advances
+     * its handle to the latest version and accepts the outcome when the winner already stored the
+     * same value. Only a genuine disagreement is propagated.
+     *
      * @param dataset     the Lance dataset (must already be materialized)
      * @param primaryKeys ordered primary-key column names; empty/null writes nothing
      * @throws IllegalArgumentException if any column name contains a comma (which would make
@@ -70,7 +79,38 @@ public final class PrimaryKeyPersistence {
                                 + "comma-delimited encoding): '" + column + "'");
             }
         }
-        dataset.updateConfig(Collections.singletonMap(PK_CONFIG_KEY, String.join(",", primaryKeys)));
+
+        String encoded = String.join(",", primaryKeys);
+        if (encoded.equals(readRaw(dataset))) {
+            // Already stored, by an earlier open or by a peer subtask that got here first.
+            // Skipping keeps the steady state free of write transactions entirely.
+            return;
+        }
+
+        try {
+            dataset.updateConfig(Collections.singletonMap(PK_CONFIG_KEY, encoded));
+        } catch (RuntimeException e) {
+            // A peer may have committed the identical value between the check above and this
+            // commit. Lance surfaces that as a plain RuntimeException from the Rust conflict
+            // resolver with no dedicated type, so the outcome is verified by re-reading rather
+            // than by matching on the message.
+            //
+            // The handle has to be advanced first: it is pinned to the version observed at open()
+            // and getConfig() would keep returning the pre-conflict snapshot, making every peer
+            // commit look like a genuine disagreement. Advancing is harmless for the caller --
+            // the sink wants the newest version anyway.
+            dataset.checkoutLatest();
+            if (encoded.equals(readRaw(dataset))) {
+                return;
+            }
+            throw e;
+        }
+    }
+
+    /** Returns the raw encoded primary-key config value, or {@code null} when absent. */
+    private static String readRaw(Dataset dataset) {
+        Map<String, String> config = dataset.getConfig();
+        return config == null ? null : config.get(PK_CONFIG_KEY);
     }
 
     /**
