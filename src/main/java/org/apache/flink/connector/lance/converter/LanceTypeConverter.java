@@ -25,12 +25,17 @@ import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DateType;
+import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.MapType;
+import org.apache.flink.table.types.logical.MultisetType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
+import org.apache.flink.table.types.logical.TimeType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarBinaryType;
@@ -39,6 +44,7 @@ import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -65,7 +71,10 @@ import java.util.List;
  *   <li>Boolean <-> BOOLEAN</li>
  *   <li>Binary/LargeBinary <-> BYTES</li>
  *   <li>Date32 <-> DATE</li>
- *   <li>Timestamp <-> TIMESTAMP</li>
+ *   <li>Time32/Time64 <-> TIME</li>
+ *   <li>Timestamp (no timezone) <-> TIMESTAMP</li>
+ *   <li>Timestamp (UTC timezone) <-> TIMESTAMP_LTZ</li>
+ *   <li>Decimal128 <-> DECIMAL</li>
  *   <li>FixedSizeList<Float32> <-> ARRAY<FLOAT></li>
  *   <li>FixedSizeList<Float64> <-> ARRAY<DOUBLE></li>
  * </ul>
@@ -74,6 +83,14 @@ public class LanceTypeConverter implements Serializable {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(LanceTypeConverter.class);
+
+    /**
+     * Bit width used for Arrow decimals.
+     *
+     * <p>Flink's DECIMAL tops out at precision 38, which fits Decimal128, so widening to 256 is
+     * never required.
+     */
+    private static final int DECIMAL_BIT_WIDTH = 128;
 
     /**
      * Convert Arrow Schema to Flink RowType
@@ -154,11 +171,22 @@ public class LanceTypeConverter implements Serializable {
             return new BinaryType(nullable, fixedBinary.getByteWidth());
         } else if (arrowType instanceof ArrowType.Date) {
             return new DateType(nullable);
+        } else if (arrowType instanceof ArrowType.Time) {
+            ArrowType.Time timeType = (ArrowType.Time) arrowType;
+            return new TimeType(nullable, getTimestampPrecision(timeType.getUnit()));
         } else if (arrowType instanceof ArrowType.Timestamp) {
             ArrowType.Timestamp tsType = (ArrowType.Timestamp) arrowType;
             // Determine precision based on time unit
             int precision = getTimestampPrecision(tsType.getUnit());
+            // A timezone marks an absolute instant, which is TIMESTAMP_LTZ on the Flink side.
+            // Without this split the zoned and unzoned forms would collapse into one.
+            if (tsType.getTimezone() != null) {
+                return new LocalZonedTimestampType(nullable, precision);
+            }
             return new TimestampType(nullable, precision);
+        } else if (arrowType instanceof ArrowType.Decimal) {
+            ArrowType.Decimal decimalType = (ArrowType.Decimal) arrowType;
+            return new DecimalType(nullable, decimalType.getPrecision(), decimalType.getScale());
         } else if (arrowType instanceof ArrowType.FixedSizeList) {
             // Vector type: FixedSizeList<Float32/Float64>
             ArrowType.FixedSizeList listType = (ArrowType.FixedSizeList) arrowType;
@@ -168,6 +196,26 @@ public class LanceTypeConverter implements Serializable {
                 return new ArrayType(nullable, elementType);
             }
             throw new UnsupportedTypeException("FixedSizeList must contain child type");
+        } else if (arrowType instanceof ArrowType.Map) {
+            // Must precede the List branch. An Arrow map is physically a list of entry structs, so
+            // a List-first check would map it to ARRAY<ROW<key, value>> and the column would stop
+            // round-tripping as a MAP.
+            List<Field> children = field.getChildren();
+            if (children == null || children.isEmpty()) {
+                throw new UnsupportedTypeException("Map must contain an entries child");
+            }
+            Field entries = children.get(0);
+            List<Field> keyValue = entries.getChildren();
+            if (keyValue == null || keyValue.size() != 2) {
+                throw new UnsupportedTypeException(
+                        "Map entries must contain exactly key and value children, found "
+                                + (keyValue == null ? 0 : keyValue.size()));
+            }
+            LogicalType keyType = arrowTypeToFlinkType(keyValue.get(0));
+            LogicalType valueType = arrowTypeToFlinkType(keyValue.get(1));
+            // Arrow guarantees a non-null key; carry that through so a round-trip does not hand
+            // back a MAP the converter would then refuse on the way in.
+            return new MapType(nullable, keyType.copy(false), valueType);
         } else if (arrowType instanceof ArrowType.List || arrowType instanceof ArrowType.LargeList) {
             // Regular list type
             List<Field> children = field.getChildren();
@@ -228,10 +276,27 @@ public class LanceTypeConverter implements Serializable {
             arrowType = new ArrowType.FixedSizeBinary(binaryType.getLength());
         } else if (logicalType instanceof DateType) {
             arrowType = new ArrowType.Date(DateUnit.DAY);
+        } else if (logicalType instanceof TimeType) {
+            // Flink TIME is time-of-day without date. Arrow splits this across bit widths:
+            // Time32 carries SECOND/MILLISECOND, Time64 carries MICROSECOND/NANOSECOND.
+            TimeType timeType = (TimeType) logicalType;
+            TimeUnit timeUnit = getArrowTimeUnit(timeType.getPrecision());
+            arrowType = new ArrowType.Time(timeUnit, getTimeBitWidth(timeUnit));
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             TimeUnit timeUnit = getArrowTimeUnit(tsType.getPrecision());
             arrowType = new ArrowType.Timestamp(timeUnit, null);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            // TIMESTAMP_LTZ denotes an absolute instant. Tagging the Arrow type with UTC keeps it
+            // distinguishable from a plain TIMESTAMP, which is what makes the round-trip lossless.
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            TimeUnit timeUnit = getArrowTimeUnit(ltzType.getPrecision());
+            arrowType = new ArrowType.Timestamp(timeUnit, "UTC");
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            arrowType =
+                    new ArrowType.Decimal(
+                            decimalType.getPrecision(), decimalType.getScale(), DECIMAL_BIT_WIDTH);
         } else if (logicalType instanceof ArrayType) {
             ArrayType arrayType = (ArrayType) logicalType;
             LogicalType elementType = arrayType.getElementType();
@@ -240,6 +305,37 @@ public class LanceTypeConverter implements Serializable {
             children.add(childField);
             // For vector types, use List type
             arrowType = ArrowType.List.INSTANCE;
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            LogicalType keyType = mapType.getKeyType();
+            // Arrow requires map keys to be non-null, while Flink's MapType allows a nullable key
+            // type. Silently widening it would let a NULL key reach the encoder, so reject it here
+            // where the message can still name the offending column.
+            if (keyType.isNullable()) {
+                throw new UnsupportedTypeException(
+                        "MAP key must be NOT NULL for column '" + name + "': Arrow map keys cannot "
+                                + "be nullable. Declare the key as e.g. MAP<STRING NOT NULL, INT>.");
+            }
+            children = new ArrayList<>();
+            children.add(mapEntriesField(name, keyType, mapType.getValueType()));
+            // keysSorted=false: nothing in the write path sorts entries, and claiming otherwise
+            // would let a reader skip its own ordering work on unordered data.
+            arrowType = new ArrowType.Map(false);
+        } else if (logicalType instanceof MultisetType) {
+            // A MULTISET is physically a MAP<element, count>, which is also how Flink represents it
+            // at runtime (getDefaultConversion is java.util.Map, and RowData.getMap works on it).
+            // So it reuses the map encoding wholesale rather than getting its own.
+            MultisetType multisetType = (MultisetType) logicalType;
+            LogicalType elementType = multisetType.getElementType();
+            if (elementType.isNullable()) {
+                throw new UnsupportedTypeException(
+                        "MULTISET element must be NOT NULL for column '" + name + "': the element "
+                                + "becomes an Arrow map key, which cannot be nullable. Declare it "
+                                + "as e.g. MULTISET<STRING NOT NULL>.");
+            }
+            children = new ArrayList<>();
+            children.add(multisetEntriesField(name, elementType));
+            arrowType = new ArrowType.Map(false);
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             children = new ArrayList<>();
@@ -257,7 +353,113 @@ public class LanceTypeConverter implements Serializable {
     }
 
     /**
-     * Create vector field (FixedSizeList<Float32>)
+     * Build the {@code entries} struct that backs an Arrow map field.
+     *
+     * <p>Arrow fixes both the names and the nullability here: the struct is called {@code entries}
+     * and must itself be non-nullable, and {@code key} must be non-nullable. Only {@code value} may
+     * be null. Getting any of that wrong surfaces later as an opaque IPC or encoder error, so the
+     * names come from {@link MapVector}'s constants rather than string literals -- note that
+     * {@code MapVector.DATA_VECTOR_NAME} is {@code entries}, whereas the inherited
+     * {@code BaseRepeatedValueVector.DATA_VECTOR_NAME} is {@code $data$}.
+     */
+    private static Field mapEntriesField(
+            String mapColumnName, LogicalType keyType, LogicalType valueType) {
+        // Arrow accepts far more element types here than the read/write path can actually move, so
+        // an unchecked MAP<STRING, DATE> would create a table whose first write fails deep in the
+        // converter. Reject it at DDL time instead, where the message can name the column.
+        requireSupportedMapElement(mapColumnName, "MAP key", keyType);
+        requireSupportedMapElement(mapColumnName, "MAP value", valueType);
+
+        Field keyField = flinkTypeToArrowField(MapVector.KEY_NAME, keyType);
+        if (keyField.isNullable()) {
+            // Defensive: the caller already rejects a nullable key type, but a converter that
+            // widened nullability on the way out would otherwise produce a schema Arrow refuses.
+            keyField =
+                    new Field(
+                            MapVector.KEY_NAME,
+                            new FieldType(false, keyField.getType(), null),
+                            keyField.getChildren());
+        }
+        Field valueField = flinkTypeToArrowField(MapVector.VALUE_NAME, valueType);
+
+        List<Field> entryChildren = new ArrayList<>();
+        entryChildren.add(keyField);
+        entryChildren.add(valueField);
+
+        return new Field(
+                MapVector.DATA_VECTOR_NAME,
+                new FieldType(false, ArrowType.Struct.INSTANCE, null),
+                entryChildren);
+    }
+
+    /**
+     * Build the {@code entries} struct backing a multiset.
+     *
+     * <p>Identical in shape to {@link #mapEntriesField}, with the value side pinned to a non-null
+     * INT: a multiset's value is an occurrence count, never user data, so it is neither nullable nor
+     * variable in type.
+     */
+    private static Field multisetEntriesField(String columnName, LogicalType elementType) {
+        requireSupportedMapElement(columnName, "MULTISET element", elementType);
+
+        Field keyField = flinkTypeToArrowField(MapVector.KEY_NAME, elementType);
+        if (keyField.isNullable()) {
+            keyField =
+                    new Field(
+                            MapVector.KEY_NAME,
+                            new FieldType(false, keyField.getType(), null),
+                            keyField.getChildren());
+        }
+        Field countField =
+                new Field(
+                        MapVector.VALUE_NAME,
+                        new FieldType(false, new ArrowType.Int(32, true), null),
+                        null);
+
+        List<Field> entryChildren = new ArrayList<>();
+        entryChildren.add(keyField);
+        entryChildren.add(countField);
+
+        return new Field(
+                MapVector.DATA_VECTOR_NAME,
+                new FieldType(false, ArrowType.Struct.INSTANCE, null),
+                entryChildren);
+    }
+
+    /**
+     * Element types the map read/write path can carry.
+     *
+     * <p>This mirrors what {@code RowDataConverter}'s array element helpers implement, since map
+     * keys and values reuse them. It is narrower than the set of types allowed for a top-level
+     * column, and widening it means extending those helpers first.
+     *
+     * @param role full description such as {@code "MAP key"} or {@code "MULTISET element"}; it is
+     *     used verbatim so the message matches the DDL the user actually wrote
+     */
+    private static void requireSupportedMapElement(
+            String mapColumnName, String role, LogicalType elementType) {
+        boolean supported =
+                elementType instanceof IntType
+                        || elementType instanceof BigIntType
+                        || elementType instanceof FloatType
+                        || elementType instanceof DoubleType
+                        || elementType instanceof VarCharType;
+        if (!supported) {
+            throw new UnsupportedTypeException(
+                    "Unsupported "
+                            + role
+                            + " type for column '"
+                            + mapColumnName
+                            + "': "
+                            + elementType.getClass().getSimpleName()
+                            + ". MAP keys and values support INT, BIGINT, FLOAT, DOUBLE and STRING. "
+                            + "Arrow would accept more, but the connector's map read/write path "
+                            + "would then fail on the first write rather than here.");
+        }
+    }
+
+    /**
+     * Create vector field (FixedSizeList&lt;Float32&gt;)
      *
      * @param name Field name
      * @param dimension Vector dimension
@@ -374,13 +576,31 @@ public class LanceTypeConverter implements Serializable {
             return DataTypes.BINARY(binaryType.getLength());
         } else if (logicalType instanceof DateType) {
             return DataTypes.DATE();
+        } else if (logicalType instanceof TimeType) {
+            return DataTypes.TIME(((TimeType) logicalType).getPrecision());
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             return DataTypes.TIMESTAMP(tsType.getPrecision());
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            return DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(ltzType.getPrecision());
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            return DataTypes.DECIMAL(decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             ArrayType arrayType = (ArrayType) logicalType;
             DataType elementDataType = toDataType(arrayType.getElementType());
             return DataTypes.ARRAY(elementDataType);
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            DataType keyDataType = toDataType(mapType.getKeyType());
+            DataType valueDataType = toDataType(mapType.getValueType());
+            // The key stays NOT NULL to match Arrow, which does not allow a nullable map key.
+            return DataTypes.MAP(keyDataType.notNull(), valueDataType);
+        } else if (logicalType instanceof MultisetType) {
+            MultisetType multisetType = (MultisetType) logicalType;
+            // The element becomes the map key, so it carries the same NOT NULL requirement.
+            return DataTypes.MULTISET(toDataType(multisetType.getElementType()).notNull());
         } else if (logicalType instanceof RowType) {
             RowType rowType = (RowType) logicalType;
             DataTypes.Field[] fields = rowType.getFields().stream()
@@ -422,6 +642,22 @@ public class LanceTypeConverter implements Serializable {
             return TimeUnit.MICROSECOND;
         } else {
             return TimeUnit.NANOSECOND;
+        }
+    }
+
+    /**
+     * Get the Arrow Time bit width required by a time unit.
+     *
+     * <p>Arrow only allows Time32 for SECOND/MILLISECOND and Time64 for MICROSECOND/NANOSECOND;
+     * pairing a unit with the wrong width is rejected when the field is constructed.
+     */
+    private static int getTimeBitWidth(TimeUnit timeUnit) {
+        switch (timeUnit) {
+            case SECOND:
+            case MILLISECOND:
+                return 32;
+            default:
+                return 64;
         }
     }
 

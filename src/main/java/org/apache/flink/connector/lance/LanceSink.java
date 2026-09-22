@@ -38,7 +38,7 @@ import org.lance.Transaction;
 import org.lance.operation.Append;
 import org.lance.operation.Overwrite;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
@@ -103,7 +103,8 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
         
         LOG.info("Opening Lance Sink: {}", options.getPath());
         
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create(
+                "lance-sink", options.getArrowAllocatorMaxBytes());
         this.buffer = new ArrayList<>(options.getWriteBatchSize());
         this.totalWrittenRows = 0;
         this.isFirstWrite = true;
@@ -165,9 +166,13 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
             }
 
             // Build write parameters
-            WriteParams writeParams = new WriteParams.Builder()
-                    .withMaxRowsPerFile(options.getWriteMaxRowsPerFile())
-                    .build();
+            WriteParams.Builder writeParamsBuilder = new WriteParams.Builder()
+                    .withMaxRowsPerFile(options.getWriteMaxRowsPerFile());
+            String storageVersion = options.getWriteDataStorageVersion();
+            if (storageVersion != null && !storageVersion.trim().isEmpty()) {
+                writeParamsBuilder.withDataStorageVersion(storageVersion.trim());
+            }
+            WriteParams writeParams = writeParamsBuilder.build();
             
             // Create Fragment
             List<FragmentMetadata> fragments = Fragment.write()

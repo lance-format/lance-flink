@@ -32,7 +32,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -96,7 +96,7 @@ public class LanceVectorSearch implements Closeable, Serializable {
     public void open() throws IOException {
         LOG.info("Opening vector search, dataset: {}", datasetPath);
         
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create("lance-vector-search");
         
         try {
             this.dataset = Dataset.open(datasetPath, allocator);

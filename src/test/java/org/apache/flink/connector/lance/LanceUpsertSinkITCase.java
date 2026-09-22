@@ -39,6 +39,12 @@ import org.lance.Dataset;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -290,25 +296,85 @@ class LanceUpsertSinkITCase {
     void twoSubtasksConcurrentFirstWrite() throws Exception {
         String path = tempDir.resolve("concurrent_first").toString();
 
-        // Dataset does NOT exist yet. Both subtasks open, then first-write.
-        LanceUpsertSink s1 = new LanceUpsertSink(options(path), rowType(),
+        // Dataset does NOT exist yet. Both subtasks open + flush in parallel: the previous
+        // Overwrite-based first-write would race here and clobber one subtask's rows. With the
+        // open-or-create + mergeInsert path, both writes must land.
+        final LanceUpsertSink s1 = new LanceUpsertSink(options(path), rowType(),
                 Arrays.asList(PRIMARY_KEYS), KEY_INDICES);
-        LanceUpsertSink s2 = new LanceUpsertSink(options(path), rowType(),
+        final LanceUpsertSink s2 = new LanceUpsertSink(options(path), rowType(),
                 Arrays.asList(PRIMARY_KEYS), KEY_INDICES);
-        s1.open(new Configuration());
-        s2.open(new Configuration());
 
+        final CountDownLatch openBarrier = new CountDownLatch(2);
+        final CountDownLatch flushBarrier = new CountDownLatch(2);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
-            s1.invoke(row(1L, "one", RowKind.INSERT), null);
-            s1.flush();
-            s2.invoke(row(2L, "two", RowKind.INSERT), null);
-            s2.flush();
+            Future<?> f1 = pool.submit(() -> runSubtask(
+                    s1, 1L, "one", openBarrier, flushBarrier, failure));
+            Future<?> f2 = pool.submit(() -> runSubtask(
+                    s2, 2L, "two", openBarrier, flushBarrier, failure));
+            f1.get(30, TimeUnit.SECONDS);
+            f2.get(30, TimeUnit.SECONDS);
         } finally {
-            s1.close();
-            s2.close();
+            pool.shutdownNow();
+            try { s1.close(); } catch (Exception ignored) { /* best effort */ }
+            try { s2.close(); } catch (Exception ignored) { /* best effort */ }
         }
 
-        // The second first-write must not clobber the first (regression: Overwrite clobbering).
+        if (failure.get() != null) {
+            throw new AssertionError("Concurrent first-write failed", failure.get());
+        }
+
+        // The concurrent first-write must not lose either row (regression: Overwrite clobbering).
         assertThat(countRows(path)).isEqualTo(2L);
+    }
+
+    private void runSubtask(
+            LanceUpsertSink sink,
+            long id,
+            String name,
+            CountDownLatch openBarrier,
+            CountDownLatch flushBarrier,
+            AtomicReference<Throwable> failure) {
+        try {
+            sink.open(new Configuration());
+            // Rendezvous after open so both subtasks contend on the empty dataset.
+            openBarrier.countDown();
+            openBarrier.await(30, TimeUnit.SECONDS);
+
+            sink.invoke(row(id, name, RowKind.INSERT), null);
+            // Rendezvous again so the two flushes hit mergeInsert concurrently.
+            flushBarrier.countDown();
+            flushBarrier.await(30, TimeUnit.SECONDS);
+
+            sink.flush();
+        } catch (Throwable t) {
+            failure.compareAndSet(null, t);
+            // Release peers so the test doesn't hang on the barrier.
+            openBarrier.countDown();
+            flushBarrier.countDown();
+        }
+    }
+
+    @Test
+    @DisplayName("close() must not implicitly flush uncheckpointed rows")
+    void closeDoesNotImplicitlyFlush() throws Exception {
+        String path = tempDir.resolve("no_close_flush").toString();
+        LanceUpsertSink sink = new LanceUpsertSink(options(path), rowType(),
+                Arrays.asList(PRIMARY_KEYS), KEY_INDICES);
+
+        sink.open(new Configuration());
+        try {
+            // Enqueue a row but do NOT flush. close() must drop it (checkpoint is the
+            // persistence boundary; the source is expected to replay on restart).
+            sink.invoke(row(42L, "unflushed", RowKind.INSERT), null);
+        } finally {
+            sink.close();
+        }
+
+        // Dataset was materialized empty in open() and never received a checkpoint-driven
+        // flush, so it must contain zero rows.
+        assertThat(countRows(path)).isZero();
     }
 }

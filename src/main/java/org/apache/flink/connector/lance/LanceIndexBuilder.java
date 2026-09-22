@@ -29,7 +29,7 @@ import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -104,7 +104,7 @@ public class LanceIndexBuilder implements Closeable, Serializable {
         
         try {
             // Initialize resources
-            this.allocator = new RootAllocator(Long.MAX_VALUE);
+            this.allocator = LanceAllocators.create("lance-index-builder");
             this.dataset = Dataset.open(datasetPath, allocator);
             
             // Validate column exists

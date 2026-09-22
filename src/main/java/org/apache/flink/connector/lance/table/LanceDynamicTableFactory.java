@@ -117,6 +117,13 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
             .defaultValue(1000000)
             .withDescription("Maximum rows per file");
 
+    public static final ConfigOption<String> WRITE_DATA_STORAGE_VERSION = ConfigOptions
+            .key("write.data-storage-version")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Lance file format version for written data files, e.g. '2.2'. "
+                    + "Unset leaves the choice to the Lance SDK. A MAP column requires 2.2+.");
+
     public static final ConfigOption<String> INDEX_TYPE = ConfigOptions
             .key("index.type")
             .stringType()
@@ -182,6 +189,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         options.add(WRITE_BATCH_SIZE);
         options.add(WRITE_MODE);
         options.add(WRITE_MAX_ROWS_PER_FILE);
+        options.add(WRITE_DATA_STORAGE_VERSION);
         options.add(INDEX_TYPE);
         options.add(INDEX_COLUMN);
         options.add(INDEX_NUM_PARTITIONS);
@@ -196,7 +204,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSource createDynamicTableSource(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateAllowingHadoopOptions(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -211,7 +219,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSink createDynamicTableSink(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateAllowingHadoopOptions(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -259,6 +267,23 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     /**
      * 提取以 {@code hadoop.} 为前缀的选项 key，供 {@code validateExcept} 跳过校验。
      */
+    /**
+     * Validate table options, tolerating the freeform {@code hadoop.*} passthrough keys.
+     *
+     * <p>{@code validateExcept} rejects an empty prefix array outright, so a table that declares no
+     * hadoop option cannot go through that overload at all — which is every table that does not
+     * target HDFS. The prefix list has to be checked before choosing which overload to call.
+     */
+    private void validateAllowingHadoopOptions(
+            FactoryUtil.TableFactoryHelper helper, Map<String, String> tableOptions) {
+        String[] hadoopKeys = extractHadoopOptionKeys(tableOptions);
+        if (hadoopKeys.length == 0) {
+            helper.validate();
+        } else {
+            helper.validateExcept(hadoopKeys);
+        }
+    }
+
     private String[] extractHadoopOptionKeys(Map<String, String> tableOptions) {
         if (tableOptions == null) {
             return new String[0];
@@ -292,6 +317,9 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         builder.writeBatchSize(config.get(WRITE_BATCH_SIZE));
         builder.writeMode(LanceOptions.WriteMode.fromValue(config.get(WRITE_MODE)));
         builder.writeMaxRowsPerFile(config.get(WRITE_MAX_ROWS_PER_FILE));
+        if (config.getOptional(WRITE_DATA_STORAGE_VERSION).isPresent()) {
+            builder.writeDataStorageVersion(config.get(WRITE_DATA_STORAGE_VERSION));
+        }
 
         // Index configuration
         builder.indexType(LanceOptions.IndexType.fromValue(config.get(INDEX_TYPE)));

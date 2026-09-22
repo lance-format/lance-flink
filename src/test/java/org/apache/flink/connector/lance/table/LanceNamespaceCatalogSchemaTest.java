@@ -44,6 +44,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -166,13 +167,78 @@ class LanceNamespaceCatalogSchemaTest {
     @Test
     @DisplayName("An unsupported column type is rejected as a schema problem")
     void testUnsupportedTypeRejected() {
+        // INTERVAL has no Arrow mapping. This case has already moved three times -- DECIMAL, then
+        // MAP, then MULTISET -- because each was a type Lance genuinely stores and so each
+        // eventually gained a mapping. An interval is not analytical storage data, so it is not on
+        // that path and this sample should stop moving.
         CatalogTable table = tableWith(
-                Schema.newBuilder().column("amount", DataTypes.DECIMAL(10, 2)).build());
+                Schema.newBuilder()
+                        .column("gap", DataTypes.INTERVAL(DataTypes.DAY()))
+                        .build());
 
         assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
                 .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
                 .hasMessageContaining("Cannot create a Lance table with this schema")
-                .hasMessageContaining("DecimalType");
+                .hasMessageContaining("DayTimeIntervalType");
+    }
+
+    @Test
+    @DisplayName("A MAP declared the obvious way is rejected, because its key is nullable")
+    void testMapWithNullableKeyRejected() {
+        // DataTypes.MAP(STRING(), INT()) produces a nullable key, which is the natural thing to
+        // write and which Arrow does not allow. The message has to say so explicitly, otherwise
+        // the user has no way to know that .notNull() on the key is what is missing.
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()))
+                        .build());
+
+        assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("attrs")
+                .hasMessageContaining("NOT NULL");
+    }
+
+    @Test
+    @DisplayName("A MAP with a NOT NULL key is accepted")
+    void testMapWithNotNullKeyAccepted() {
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column(
+                                "attrs",
+                                DataTypes.MAP(DataTypes.STRING().notNull(), DataTypes.INT()))
+                        .build());
+
+        assertThatCode(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("A MULTISET declared the obvious way is rejected, because its element is nullable")
+    void testMultisetWithNullableElementRejected() {
+        // Same trap as MAP: DataTypes.MULTISET(DataTypes.STRING()) yields a nullable element, and
+        // the element becomes the Arrow map key, which cannot be nullable.
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("tags", DataTypes.MULTISET(DataTypes.STRING()))
+                        .build());
+
+        assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("tags")
+                .hasMessageContaining("NOT NULL");
+    }
+
+    @Test
+    @DisplayName("A MULTISET with a NOT NULL element is accepted")
+    void testMultisetWithNotNullElementAccepted() {
+        CatalogTable table = tableWith(
+                Schema.newBuilder()
+                        .column("tags", DataTypes.MULTISET(DataTypes.STRING().notNull()))
+                        .build());
+
+        assertThatCode(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
+                .doesNotThrowAnyException();
     }
 
     @Test

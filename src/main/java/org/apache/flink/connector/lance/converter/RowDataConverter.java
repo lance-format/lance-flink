@@ -19,6 +19,9 @@
 package org.apache.flink.connector.lance.converter;
 
 import org.apache.flink.table.data.ArrayData;
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericMapData;
+import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.GenericArrayData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -29,12 +32,17 @@ import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DateType;
+import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.MapType;
+import org.apache.flink.table.types.logical.MultisetType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
+import org.apache.flink.table.types.logical.TimeType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarBinaryType;
@@ -44,15 +52,24 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeMicroVector;
+import org.apache.arrow.vector.TimeMilliVector;
+import org.apache.arrow.vector.TimeNanoVector;
+import org.apache.arrow.vector.TimeSecVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
+import org.apache.arrow.vector.TimeStampMilliTZVector;
 import org.apache.arrow.vector.TimeStampMilliVector;
+import org.apache.arrow.vector.TimeStampNanoTZVector;
 import org.apache.arrow.vector.TimeStampNanoVector;
+import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.TimeStampSecVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
@@ -60,16 +77,20 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 
 /**
@@ -78,6 +99,12 @@ import java.util.List;
  * <p>Responsible for bidirectional conversion between Arrow VectorSchemaRoot and Flink RowData.
  */
 public class RowDataConverter implements Serializable {
+
+    /**
+     * The value side of a multiset is an occurrence count: always present, always an int. Pinning it
+     * here keeps the read and write paths from disagreeing about it.
+     */
+    private static final LogicalType MULTISET_COUNT_TYPE = new IntType(false);
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(RowDataConverter.class);
@@ -197,10 +224,27 @@ public class RowDataConverter implements Serializable {
         } else if (logicalType instanceof DateType) {
             int daysSinceEpoch = ((DateDayVector) vector).get(index);
             return daysSinceEpoch;
+        } else if (logicalType instanceof TimeType) {
+            return readTime(vector, index);
         } else if (logicalType instanceof TimestampType) {
             return readTimestamp(vector, index, (TimestampType) logicalType);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            return readLocalZonedTimestamp(vector, index);
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            BigDecimal value = ((DecimalVector) vector).getObject(index);
+            return DecimalData.fromBigDecimal(
+                    value, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return readArray(vector, index, (ArrayType) logicalType);
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            return readMap(vector, index, mapType.getKeyType(), mapType.getValueType());
+        } else if (logicalType instanceof MultisetType) {
+            // A multiset is stored as MAP<element, count>, so it reads back through the same path
+            // with the count side pinned to a non-null INT.
+            MultisetType multisetType = (MultisetType) logicalType;
+            return readMap(vector, index, multisetType.getElementType(), MULTISET_COUNT_TYPE);
         } else if (logicalType instanceof RowType) {
             return readStruct(vector, index, (RowType) logicalType);
         }
@@ -235,6 +279,53 @@ public class RowDataConverter implements Serializable {
     }
 
     /**
+     * Read a TIME value as milliseconds since midnight.
+     *
+     * <p>Flink represents TIME as an int holding milliseconds of the day, so the sub-millisecond
+     * units Arrow allows are narrowed down to that resolution here.
+     */
+    private int readTime(FieldVector vector, int index) {
+        if (vector instanceof TimeSecVector) {
+            return ((TimeSecVector) vector).get(index) * 1000;
+        } else if (vector instanceof TimeMilliVector) {
+            return ((TimeMilliVector) vector).get(index);
+        } else if (vector instanceof TimeMicroVector) {
+            return (int) (((TimeMicroVector) vector).get(index) / 1000L);
+        } else if (vector instanceof TimeNanoVector) {
+            return (int) (((TimeNanoVector) vector).get(index) / 1_000_000L);
+        }
+
+        throw new LanceTypeConverter.UnsupportedTypeException(
+                "Unsupported time Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
+     * Read a TIMESTAMP_LTZ value.
+     *
+     * <p>Arrow exposes zoned timestamps through dedicated *TZ vectors, so these are distinct
+     * classes from the ones {@link #readTimestamp} handles. Values are epoch-based, which is
+     * exactly what {@link TimestampData#fromEpochMillis} expects, so no zone shifting is applied.
+     */
+    private TimestampData readLocalZonedTimestamp(FieldVector vector, int index) {
+        if (vector instanceof TimeStampSecTZVector) {
+            return TimestampData.fromEpochMillis(((TimeStampSecTZVector) vector).get(index) * 1000L);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            return TimestampData.fromEpochMillis(((TimeStampMilliTZVector) vector).get(index));
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            long micros = ((TimeStampMicroTZVector) vector).get(index);
+            return TimestampData.fromEpochMillis(
+                    Math.floorDiv(micros, 1000L), (int) Math.floorMod(micros, 1000L) * 1000);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            long nanos = ((TimeStampNanoTZVector) vector).get(index);
+            return TimestampData.fromEpochMillis(
+                    Math.floorDiv(nanos, 1_000_000L), (int) Math.floorMod(nanos, 1_000_000L));
+        }
+
+        throw new LanceTypeConverter.UnsupportedTypeException(
+                "Unsupported zoned timestamp Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
      * Read array value
      */
     private ArrayData readArray(FieldVector vector, int index, ArrayType arrayType) {
@@ -259,6 +350,66 @@ public class RowDataConverter implements Serializable {
 
         throw new LanceTypeConverter.UnsupportedTypeException(
                 "Unsupported array Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
+     * Read map value.
+     *
+     * <p>An Arrow map is a list of non-nullable {@code entries} structs, each holding a {@code key}
+     * and a {@code value} child. The offsets come from the enclosing list, so the key and value
+     * slices are read from the same index range.
+     */
+    private MapData readMap(
+            FieldVector vector, int index, LogicalType keyType, LogicalType valueType) {
+        if (!(vector instanceof MapVector)) {
+            // Note this cannot be relaxed to ListVector: a plain list carries no key child, and
+            // treating one as a map would read garbage out of the element vector.
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported map Vector type: " + vector.getClass().getSimpleName());
+        }
+
+        MapVector mapVector = (MapVector) vector;
+        int startIndex = mapVector.getElementStartIndex(index);
+        int endIndex = mapVector.getElementEndIndex(index);
+        int size = endIndex - startIndex;
+
+        StructVector entries = (StructVector) mapVector.getDataVector();
+        FieldVector keyVector = entries.getChild(MapVector.KEY_NAME);
+        FieldVector valueVector = entries.getChild(MapVector.VALUE_NAME);
+        if (keyVector == null || valueVector == null) {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Map entries struct must expose '" + MapVector.KEY_NAME + "' and '"
+                            + MapVector.VALUE_NAME + "' children");
+        }
+
+        ArrayData keys = readArrayData(keyVector, startIndex, size, keyType);
+        ArrayData values = readArrayData(valueVector, startIndex, size, valueType);
+        return new GenericMapData(toJavaMap(keys, values, keyType, valueType));
+    }
+
+    /**
+     * Materialize key/value slices into the map {@link GenericMapData} expects.
+     *
+     * <p>Duplicate keys collapse to the last occurrence, matching how Flink's own map
+     * implementations behave when a duplicate reaches them.
+     */
+    private Map<Object, Object> toJavaMap(
+            ArrayData keys, ArrayData values, LogicalType keyType, LogicalType valueType) {
+        Map<Object, Object> result = new LinkedHashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            Object key = elementAt(keys, i, keyType);
+            Object value = elementAt(values, i, valueType);
+            result.put(key, value);
+        }
+        return result;
+    }
+
+    /** Extract one element out of an {@link ArrayData} as the object GenericMapData stores. */
+    private Object elementAt(ArrayData array, int i, LogicalType elementType) {
+        if (array.isNullAt(i)) {
+            return null;
+        }
+        return ArrayData.createElementGetter(elementType).getElementOrNull(array, i);
     }
 
     /**
@@ -376,11 +527,22 @@ public class RowDataConverter implements Serializable {
             return rowData.getBinary(index);
         } else if (logicalType instanceof DateType) {
             return rowData.getInt(index);
+        } else if (logicalType instanceof TimeType) {
+            return rowData.getInt(index);
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             return rowData.getTimestamp(index, tsType.getPrecision());
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            return rowData.getTimestamp(index, ltzType.getPrecision());
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            return rowData.getDecimal(index, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return rowData.getArray(index);
+        } else if (logicalType instanceof MapType || logicalType instanceof MultisetType) {
+            // Flink hands both back as MapData; MultisetType.getDefaultConversion is java.util.Map.
+            return rowData.getMap(index);
         } else if (logicalType instanceof RowType) {
             RowType nestedRowType = (RowType) logicalType;
             return rowData.getRow(index, nestedRowType.getFieldCount());
@@ -422,10 +584,34 @@ public class RowDataConverter implements Serializable {
             ((FixedSizeBinaryVector) vector).setSafe(index, (byte[]) value);
         } else if (logicalType instanceof DateType) {
             ((DateDayVector) vector).setSafe(index, (int) value);
+        } else if (logicalType instanceof TimeType) {
+            writeTime(vector, index, (int) value);
         } else if (logicalType instanceof TimestampType) {
             writeTimestamp(vector, index, (TimestampData) value, (TimestampType) logicalType);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            writeLocalZonedTimestamp(vector, index, (TimestampData) value);
+        } else if (logicalType instanceof DecimalType) {
+            ((DecimalVector) vector).setSafe(index, ((DecimalData) value).toBigDecimal());
         } else if (logicalType instanceof ArrayType) {
             writeArray(vector, index, (ArrayData) value, (ArrayType) logicalType);
+        } else if (logicalType instanceof MapType) {
+            MapType mapType = (MapType) logicalType;
+            writeMap(
+                    vector,
+                    index,
+                    (MapData) value,
+                    mapType.getKeyType(),
+                    mapType.getValueType(),
+                    "MAP key");
+        } else if (logicalType instanceof MultisetType) {
+            MultisetType multisetType = (MultisetType) logicalType;
+            writeMap(
+                    vector,
+                    index,
+                    (MapData) value,
+                    multisetType.getElementType(),
+                    MULTISET_COUNT_TYPE,
+                    "MULTISET element");
         } else if (logicalType instanceof RowType) {
             writeStruct(vector, index, (RowData) value, (RowType) logicalType);
         } else {
@@ -468,12 +654,45 @@ public class RowDataConverter implements Serializable {
             ((TimeStampMicroVector) vector).setNull(index);
         } else if (vector instanceof TimeStampNanoVector) {
             ((TimeStampNanoVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampSecTZVector) {
+            ((TimeStampSecTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            ((TimeStampMilliTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            ((TimeStampMicroTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            ((TimeStampNanoTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeSecVector) {
+            ((TimeSecVector) vector).setNull(index);
+        } else if (vector instanceof TimeMilliVector) {
+            ((TimeMilliVector) vector).setNull(index);
+        } else if (vector instanceof TimeMicroVector) {
+            ((TimeMicroVector) vector).setNull(index);
+        } else if (vector instanceof TimeNanoVector) {
+            ((TimeNanoVector) vector).setNull(index);
+        } else if (vector instanceof DecimalVector) {
+            ((DecimalVector) vector).setNull(index);
         } else if (vector instanceof FixedSizeListVector) {
             ((FixedSizeListVector) vector).setNull(index);
+        } else if (vector instanceof MapVector) {
+            // Must precede ListVector: MapVector extends ListVector, so the ListVector branch
+            // would otherwise swallow it and null the map as if it were a plain list.
+            ((MapVector) vector).setNull(index);
         } else if (vector instanceof ListVector) {
             ((ListVector) vector).setNull(index);
         } else if (vector instanceof StructVector) {
             ((StructVector) vector).setNull(index);
+        } else {
+            // Falling through silently is data corruption, not a harmless no-op. The validity
+            // bit of a slot that already holds a value stays set, so the previous row's value is
+            // emitted as this row's value with no error anywhere. A freshly allocated vector
+            // hides it -- the zeroed validity buffer reads back as null while getNullCount()
+            // still reports 0 -- which is why this went unnoticed. readValue, getFieldValue and
+            // writeValue all reject unknown types; this branch makes setNull consistent.
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Cannot write NULL: unsupported Arrow vector "
+                            + vector.getClass().getSimpleName()
+                            + " for field '" + vector.getField().getName() + "'");
         }
     }
 
@@ -497,6 +716,51 @@ public class RowDataConverter implements Serializable {
         } else {
             throw new LanceTypeConverter.UnsupportedTypeException(
                     "Unsupported timestamp Vector type: " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Write a TIME value given as milliseconds since midnight.
+     *
+     * <p>The incoming value is always millisecond-resolution because that is Flink's internal
+     * representation, so the finer Arrow units are scaled up rather than truncated.
+     */
+    private void writeTime(FieldVector vector, int index, int millisOfDay) {
+        if (vector instanceof TimeSecVector) {
+            ((TimeSecVector) vector).setSafe(index, millisOfDay / 1000);
+        } else if (vector instanceof TimeMilliVector) {
+            ((TimeMilliVector) vector).setSafe(index, millisOfDay);
+        } else if (vector instanceof TimeMicroVector) {
+            ((TimeMicroVector) vector).setSafe(index, millisOfDay * 1000L);
+        } else if (vector instanceof TimeNanoVector) {
+            ((TimeNanoVector) vector).setSafe(index, millisOfDay * 1_000_000L);
+        } else {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported time Vector type: " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Write a TIMESTAMP_LTZ value into one of Arrow's zoned timestamp vectors.
+     *
+     * <p>{@link TimestampData} already holds an epoch-based instant for this type, so the value is
+     * written as-is; applying a zone offset here would shift the instant.
+     */
+    private void writeLocalZonedTimestamp(FieldVector vector, int index, TimestampData tsData) {
+        long millis = tsData.getMillisecond();
+        int nanos = tsData.getNanoOfMillisecond();
+
+        if (vector instanceof TimeStampSecTZVector) {
+            ((TimeStampSecTZVector) vector).setSafe(index, millis / 1000);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            ((TimeStampMilliTZVector) vector).setSafe(index, millis);
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            ((TimeStampMicroTZVector) vector).setSafe(index, millis * 1000L + nanos / 1000);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            ((TimeStampNanoTZVector) vector).setSafe(index, millis * 1_000_000L + nanos);
+        } else {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported zoned timestamp Vector type: " + vector.getClass().getSimpleName());
         }
     }
 
@@ -534,6 +798,61 @@ public class RowDataConverter implements Serializable {
             throw new LanceTypeConverter.UnsupportedTypeException(
                     "Unsupported array Vector type: " + vector.getClass().getSimpleName());
         }
+    }
+
+    /**
+     * Write map value.
+     *
+     * <p>Mirrors {@link #writeArray}'s list handling for the offsets, with two additions specific
+     * to maps: each {@code entries} slot has to be marked defined or the struct reads back as NULL
+     * even though key and value were written, and a NULL key is rejected because Arrow does not
+     * allow one.
+     */
+    private void writeMap(
+            FieldVector vector,
+            int index,
+            MapData mapData,
+            LogicalType keyType,
+            LogicalType valueType,
+            String keyRole) {
+        if (!(vector instanceof MapVector)) {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported map Vector type: " + vector.getClass().getSimpleName());
+        }
+
+        MapVector mapVector = (MapVector) vector;
+        ArrayData keys = mapData.keyArray();
+        ArrayData values = mapData.valueArray();
+        int size = mapData.size();
+
+        for (int i = 0; i < size; i++) {
+            if (keys.isNullAt(i)) {
+                // keyRole names what the user actually wrote -- a MULTISET has no "key", so
+                // reporting one would send them looking for something that is not in their DDL.
+                throw new IllegalArgumentException(
+                        keyRole + " must not be NULL: Arrow map keys are non-nullable, so a NULL "
+                                + "key cannot be written (entry " + i + ")");
+            }
+        }
+
+        mapVector.startNewValue(index);
+
+        StructVector entries = (StructVector) mapVector.getDataVector();
+        FieldVector keyVector = entries.getChild(MapVector.KEY_NAME);
+        FieldVector valueVector = entries.getChild(MapVector.VALUE_NAME);
+        int startIndex = mapVector.getElementStartIndex(index);
+
+        writeArrayData(keyVector, startIndex, keys, keyType);
+        writeArrayData(valueVector, startIndex, values, valueType);
+
+        // Without this the entries struct keeps a zero validity bit and the whole entry reads back
+        // as NULL, which looks like data loss rather than a missing flag.
+        for (int i = 0; i < size; i++) {
+            entries.setIndexDefined(startIndex + i);
+        }
+        entries.setValueCount(startIndex + size);
+
+        mapVector.endValue(index, size);
     }
 
     /**

@@ -139,6 +139,26 @@ public class LanceOptions implements Serializable {
             .defaultValue(1000000)
             .withDescription("Maximum rows per data file, default 1000000");
 
+    /**
+     * Lance file format version used when writing data files.
+     *
+     * <p>Deliberately has no default: leaving it unset lets the SDK pick, so a future SDK whose
+     * default moves forward is not held back by a value hardcoded here. Only set it when a
+     * specific encoding is required.
+     *
+     * <p>Some Arrow types are gated on the format version -- a MAP column needs 2.2 or newer, and
+     * on 2.1 the schema is accepted at CREATE TABLE while the first write fails inside the Rust
+     * encoder. The version is fixed when the dataset is created, so an existing dataset is not
+     * upgraded by changing this option.
+     */
+    public static final ConfigOption<String> WRITE_DATA_STORAGE_VERSION = ConfigOptions
+            .key("write.data-storage-version")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Lance file format version for written data files, e.g. '2.2'. "
+                    + "Unset leaves the choice to the Lance SDK. A MAP column requires 2.2+. "
+                    + "Fixed at dataset creation; changing it does not upgrade an existing dataset.");
+
     // ==================== Vector Index Configuration ====================
 
     /**
@@ -280,6 +300,22 @@ public class LanceOptions implements Serializable {
             .noDefaultValue()
             .withDescription("Lance data warehouse path (required)");
 
+    // ==================== Memory Configuration ====================
+
+    /**
+     * Upper bound in bytes for each Arrow allocator created by the connector.
+     *
+     * <p>Opt-in: when unset the allocator is unbounded, which is the historical behaviour. The
+     * bound applies per allocator instance (one per sink, source, catalog or index builder), so it
+     * caps a single component's blast radius rather than the connector's total footprint.
+     */
+    public static final ConfigOption<Long> ARROW_ALLOCATOR_MAX_BYTES = ConfigOptions
+            .key("arrow.allocator-max-bytes")
+            .longType()
+            .defaultValue(Long.MAX_VALUE)
+            .withDescription(
+                    "Maximum bytes each Arrow allocator may reserve. Defaults to unlimited.");
+
     // ==================== Write Mode Enum ====================
 
     /**
@@ -381,6 +417,7 @@ public class LanceOptions implements Serializable {
     private final int writeBatchSize;
     private final WriteMode writeMode;
     private final int writeMaxRowsPerFile;
+    private final String writeDataStorageVersion;
     private final IndexType indexType;
     private final String indexColumn;
     private final int indexNumPartitions;
@@ -397,6 +434,7 @@ public class LanceOptions implements Serializable {
     private final String defaultDatabase;
     private final String warehouse;
     private final Map<String, String> hadoopConfig;
+    private final long arrowAllocatorMaxBytes;
 
     private LanceOptions(Builder builder) {
         this.path = builder.path;
@@ -409,6 +447,7 @@ public class LanceOptions implements Serializable {
         this.writeBatchSize = builder.writeBatchSize;
         this.writeMode = builder.writeMode;
         this.writeMaxRowsPerFile = builder.writeMaxRowsPerFile;
+        this.writeDataStorageVersion = builder.writeDataStorageVersion;
         this.indexType = builder.indexType;
         this.indexColumn = builder.indexColumn;
         this.indexNumPartitions = builder.indexNumPartitions;
@@ -427,6 +466,7 @@ public class LanceOptions implements Serializable {
         this.hadoopConfig = builder.hadoopConfig == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(builder.hadoopConfig));
+        this.arrowAllocatorMaxBytes = builder.arrowAllocatorMaxBytes;
     }
 
     // ==================== Getter Methods ====================
@@ -469,6 +509,13 @@ public class LanceOptions implements Serializable {
 
     public int getWriteMaxRowsPerFile() {
         return writeMaxRowsPerFile;
+    }
+
+    /**
+     * Lance file format version for written data files, or {@code null} to let the SDK decide.
+     */
+    public String getWriteDataStorageVersion() {
+        return writeDataStorageVersion;
     }
 
     public IndexType getIndexType() {
@@ -541,6 +588,14 @@ public class LanceOptions implements Serializable {
         return hadoopConfig;
     }
 
+    /**
+     * Upper bound in bytes for the Arrow allocator created by the component consuming these
+     * options. {@link Long#MAX_VALUE} means unbounded.
+     */
+    public long getArrowAllocatorMaxBytes() {
+        return arrowAllocatorMaxBytes;
+    }
+
     // ==================== Builder ====================
 
     public static Builder builder() {
@@ -583,6 +638,9 @@ public class LanceOptions implements Serializable {
         builder.writeBatchSize(config.get(WRITE_BATCH_SIZE));
         builder.writeMode(WriteMode.fromValue(config.get(WRITE_MODE)));
         builder.writeMaxRowsPerFile(config.get(WRITE_MAX_ROWS_PER_FILE));
+        if (config.contains(WRITE_DATA_STORAGE_VERSION)) {
+            builder.writeDataStorageVersion(config.get(WRITE_DATA_STORAGE_VERSION));
+        }
 
         // Index configuration
         builder.indexType(IndexType.fromValue(config.get(INDEX_TYPE)));
@@ -615,6 +673,9 @@ public class LanceOptions implements Serializable {
             builder.warehouse(config.get(WAREHOUSE));
         }
 
+        // Memory configuration
+        builder.arrowAllocatorMaxBytes(config.get(ARROW_ALLOCATOR_MAX_BYTES));
+
         return builder.build();
     }
 
@@ -632,6 +693,7 @@ public class LanceOptions implements Serializable {
         private int writeBatchSize = 1024;
         private WriteMode writeMode = WriteMode.APPEND;
         private int writeMaxRowsPerFile = 1000000;
+        private String writeDataStorageVersion = null;
         private IndexType indexType = IndexType.IVF_PQ;
         private String indexColumn;
         private int indexNumPartitions = 256;
@@ -648,6 +710,16 @@ public class LanceOptions implements Serializable {
         private String defaultDatabase = "default";
         private String warehouse;
         private Map<String, String> hadoopConfig;
+        private long arrowAllocatorMaxBytes = Long.MAX_VALUE;
+
+        /**
+         * Bound the Arrow allocator to {@code maxBytes}. Non-positive values are normalised to
+         * unbounded so a misconfigured value degrades to the historical behaviour.
+         */
+        public Builder arrowAllocatorMaxBytes(long maxBytes) {
+            this.arrowAllocatorMaxBytes = maxBytes > 0 ? maxBytes : Long.MAX_VALUE;
+            return this;
+        }
 
         public Builder path(String path) {
             this.path = path;
@@ -691,6 +763,11 @@ public class LanceOptions implements Serializable {
 
         public Builder writeMode(WriteMode writeMode) {
             this.writeMode = writeMode;
+            return this;
+        }
+
+        public Builder writeDataStorageVersion(String writeDataStorageVersion) {
+            this.writeDataStorageVersion = writeDataStorageVersion;
             return this;
         }
 
@@ -863,6 +940,7 @@ public class LanceOptions implements Serializable {
                 Objects.equals(readLimit, that.readLimit) &&
                 writeBatchSize == that.writeBatchSize &&
                 writeMaxRowsPerFile == that.writeMaxRowsPerFile &&
+                Objects.equals(writeDataStorageVersion, that.writeDataStorageVersion) &&
                 indexNumPartitions == that.indexNumPartitions &&
                 indexNumBits == that.indexNumBits &&
                 indexMaxLevel == that.indexMaxLevel &&
@@ -889,7 +967,7 @@ public class LanceOptions implements Serializable {
     @Override
     public int hashCode() {
         return Objects.hash(path, readBatchSize, readLimit, readColumns, readFilter, writeBatchSize, writeMode,
-                writeMaxRowsPerFile, indexType, indexColumn, indexNumPartitions, indexNumSubVectors,
+                writeMaxRowsPerFile, writeDataStorageVersion, indexType, indexColumn, indexNumPartitions, indexNumSubVectors,
                 indexNumBits, indexMaxLevel, indexM, indexEfConstruction, vectorColumn, vectorMetric,
                 vectorNprobes, vectorEf, vectorRefineFactor, defaultDatabase, warehouse,
                 readVersion, readAsOfTimestamp);
@@ -908,6 +986,7 @@ public class LanceOptions implements Serializable {
                 ", writeBatchSize=" + writeBatchSize +
                 ", writeMode=" + writeMode +
                 ", writeMaxRowsPerFile=" + writeMaxRowsPerFile +
+                ", writeDataStorageVersion=" + writeDataStorageVersion +
                 ", indexType=" + indexType +
                 ", indexColumn='" + indexColumn + '\'' +
                 ", indexNumPartitions=" + indexNumPartitions +

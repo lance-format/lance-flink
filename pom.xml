@@ -22,10 +22,16 @@
              JDK 17 encapsulates that, so MemoryUtil's static initializer throws a
              RuntimeException naming this exact flag. On JDK 11 it is only an
              illegal-reflective-access warning, and passing the flag there is harmless.
+
+             java.util is opened for Flink's Kryo serializer, which reflects into
+             Arrays$ArrayList to read its backing array. Batch-mode tests hit this through
+             SortingDataInput; on JDK 11 the reflection only warns, so the omission is
+             invisible there and only surfaces on 17+ as InaccessibleObjectException.
+
              surefire and failsafe both read ${argLine} by default, and
              jacoco:prepare-agent appends its -javaagent to this property rather than
              replacing it, so the two coexist. -->
-        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED</argLine>
 
         <!-- Lance Flink Connector 版本 -->
         <lance-flink.version>0.1.0</lance-flink.version>
@@ -288,6 +294,18 @@
                     <version>3.1.2</version>
                 </plugin>
 
+                <!-- Failsafe：执行 *ITCase 集成测试。
+                     surefire 的默认 includes 不匹配 ITCase 后缀，因此这些用例必须由
+                     failsafe 在 integration-test 阶段执行，否则 mvn test / mvn verify
+                     都会静默跳过它们。
+                     版本与 surefire (3.1.2) 不同步，因为 3.1.2 的 failsafe 在内部镜像
+                     不可用；两者版本独立，无需严格一致。 -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>3.3.0</version>
+                </plugin>
+
                 <!-- Build Helper Maven Plugin (用于添加额外源码目录) -->
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
@@ -480,6 +498,21 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <!-- integration-test runs the cases; verify is what turns a failure
+                                 into a build failure. Without the verify goal the reports are
+                                 written but the build still passes. -->
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

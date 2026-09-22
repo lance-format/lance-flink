@@ -12,6 +12,37 @@ Read optimizations are pushed down to Lance natively to reduce I/O.
 | Limit | `SupportsLimitPushDown` | `LIMIT` is pushed down |
 | Aggregate | `SupportsAggregatePushDown` | Eligible aggregates run natively |
 
+## Predicate pushdown coverage
+
+A predicate that cannot be translated faithfully is **not** pushed down. It is
+returned to Flink, which evaluates it itself, so results are always correct —
+only the I/O saving is lost.
+
+Pushed down:
+
+- Comparisons `=`, `!=`, `>`, `>=`, `<`, `<=`, and `LIKE`
+- `AND`, `OR`, `NOT`
+- `IS NULL`, `IS NOT NULL`
+- `IN` and `BETWEEN` — the planner expands these into an `OR` chain and a
+  `>=`/`<=` conjunction respectively before the connector sees them, so they
+  push down through the rules above rather than as their own operators
+
+Column names are emitted as backtick-quoted identifiers, so names containing
+spaces, uppercase letters, or SQL keywords resolve correctly.
+
+Evaluated by Flink instead:
+
+- Columns whose name contains `.` — Lance reads a dot as nested-field access
+  and provides no escape for it
+- Columns whose name contains a backtick
+- `NaN` and `Infinity` literals, which have no valid predicate form
+- `TIME` literals, which Lance's filter grammar does not express
+
+Temporal and decimal literals are rendered with the type prefix Lance requires
+(`date '2026-03-14'`, `timestamp(3) '2026-03-14 15:09:26'`,
+`decimal(10,2) '1234.50'`), so a `DATE` or `TIMESTAMP` column is compared as a
+temporal value rather than as a string.
+
 ## Example
 
 ```sql
