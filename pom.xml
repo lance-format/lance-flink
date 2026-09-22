@@ -22,10 +22,16 @@
              JDK 17 encapsulates that, so MemoryUtil's static initializer throws a
              RuntimeException naming this exact flag. On JDK 11 it is only an
              illegal-reflective-access warning, and passing the flag there is harmless.
+
+             java.util is opened for Flink's Kryo serializer, which reflects into
+             Arrays$ArrayList to read its backing array. Batch-mode tests hit this through
+             SortingDataInput; on JDK 11 the reflection only warns, so the omission is
+             invisible there and only surfaces on 17+ as InaccessibleObjectException.
+
              surefire and failsafe both read ${argLine} by default, and
              jacoco:prepare-agent appends its -javaagent to this property rather than
              replacing it, so the two coexist. -->
-        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED</argLine>
 
         <!-- Lance Flink Connector 版本 -->
         <lance-flink.version>0.1.0</lance-flink.version>
