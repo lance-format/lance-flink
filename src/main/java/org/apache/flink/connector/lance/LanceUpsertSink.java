@@ -27,25 +27,18 @@ import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.data.StringData;
-import org.apache.flink.table.types.logical.BigIntType;
-import org.apache.flink.table.types.logical.BooleanType;
-import org.apache.flink.table.types.logical.DoubleType;
-import org.apache.flink.table.types.logical.FloatType;
-import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
-import org.apache.flink.table.types.logical.SmallIntType;
-import org.apache.flink.table.types.logical.TinyIntType;
-import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.types.RowKind;
 
 import org.lance.Dataset;
 import org.lance.WriteParams;
 import org.lance.merge.MergeInsertParams;
+import org.lance.merge.MergeInsertResult;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,9 +66,27 @@ import java.util.Map;
  *   <li>{@code INSERT}/{@code UPDATE_AFTER} &rarr; native upsert via
  *       {@link Dataset#mergeInsert} ({@code WhenMatched.UpdateAll} +
  *       {@code WhenNotMatched.InsertAll}).</li>
- *   <li>{@code DELETE} &rarr; {@link Dataset#delete} with an OR-of-AND predicate.</li>
+ *   <li>{@code DELETE} &rarr; native key-only {@link Dataset#mergeInsert}
+ *       ({@code WhenMatched.Delete} + {@code WhenNotMatched.DoNothing}); see
+ *       {@link #deleteRows}.</li>
  *   <li>{@code UPDATE_BEFORE} &rarr; dropped (upsert has no need for the old value).</li>
  * </ul>
+ *
+ * <h3>Hot primary keys</h3>
+ * <p>{@code LanceDynamicTableSink} routes CDC events through {@code keyBy(PrimaryKeySelector)} so
+ * every event for a key lands on one subtask in order. That ordering is what makes the per-flush
+ * delete/upsert sequence correct, but it also means throughput for a key is bounded by a single
+ * subtask. If the key distribution is skewed — one {@code tenant_id} carrying most of the traffic,
+ * say — that subtask becomes the pipeline's ceiling while its peers idle.
+ *
+ * <p>The per-key buffer collapsing below partially absorbs this for update-heavy workloads, since
+ * repeated writes to one key within a checkpoint fold into a single operation. It does not help
+ * when the hot key receives many <em>distinct</em> keys' worth of volume.
+ *
+ * <p>Mitigation is schema-level: prefer a composite primary key that includes a
+ * higher-cardinality column, or salt the key, when the natural key is known to be skewed.
+ * Two-level hashing is deliberately not offered — it would break in-key ordering and with it the
+ * correctness of the flush sequence.
  *
  * <h3>Consistency model</h3>
  * <p>This sink provides <b>at-least-once</b> semantics, not exactly-once:
@@ -132,6 +143,7 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     private transient Dataset dataset;
     private transient RowDataConverter converter;
     private transient Schema arrowSchema;
+    private transient Schema keyArrowSchema;
     private transient Map<RowData, RowData> buffer;
     private transient long totalWrittenRows;
 
@@ -159,11 +171,17 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
         }
         LOG.info("Opening Lance Upsert Sink: {}", datasetPath);
 
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create(
+                "lance-upsert-sink", options.getArrowAllocatorMaxBytes());
         this.buffer = new LinkedHashMap<>();
         this.totalWrittenRows = 0;
         this.converter = new RowDataConverter(rowType);
         this.arrowSchema = LanceTypeConverter.toArrowSchema(rowType);
+        // Projection of arrowSchema down to the primary-key columns, used as the source batch for
+        // delete. Derived from arrowSchema (rather than converted separately from rowType) so the
+        // key fields are guaranteed byte-identical to their counterparts in the full schema — a
+        // mismatch there would make the native join silently fail to match.
+        this.keyArrowSchema = projectKeySchema(this.arrowSchema);
 
         // OVERWRITE mode: only supported for local filesystem paths. For remote storage the
         // truncation must be performed at DDL time (e.g. via catalog CREATE OR REPLACE) — the
@@ -220,6 +238,23 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
                 }
             }
         }
+    }
+
+    /**
+     * Project the full Arrow schema down to just the primary-key fields, preserving their order in
+     * {@link #keyIndices}.
+     *
+     * <p>Fields are taken from the already-built full schema by index so the delete source batch
+     * and the table share identical field definitions (type, nullability, metadata). Building the
+     * key schema independently would risk a subtle divergence that the native join would express
+     * as "nothing matched" rather than as an error.
+     */
+    private Schema projectKeySchema(Schema fullSchema) {
+        List<Field> keyFields = new ArrayList<>(keyIndices.length);
+        for (int keyIndex : keyIndices) {
+            keyFields.add(fullSchema.getFields().get(keyIndex));
+        }
+        return new Schema(keyFields);
     }
 
     @Override
@@ -293,78 +328,118 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
 
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
             converter.toVectorSchemaRoot(rows, root);
-            ArrowArrayStreams.mergeInsert(dataset, params, allocator, root);
+            MergeInsertResult result =
+                    ArrowArrayStreams.mergeInsert(dataset, params, allocator, root);
+            adoptResultHandle(result, "upsert");
+        } catch (IOException e) {
+            throw e;
         } catch (Exception e) {
             throw new IOException("Failed to merge-insert Lance rows", e);
         }
     }
 
     /**
-     * Delete rows by an OR-of-AND predicate over the primary-key columns.
+     * Delete rows by primary key using a native key-only {@code mergeInsert}.
+     *
+     * <p>This replaces the previous {@code Dataset#delete(String)} call that built an
+     * {@code (k1 = v1 AND ...) OR (...)} SQL predicate from the buffered rows. That approach had
+     * four problems, all of which are structurally eliminated here rather than patched:
+     *
+     * <ul>
+     *   <li><b>Injection surface.</b> Column names were interpolated unescaped and values were
+     *       hand-quoted, so a primary key containing SQL metacharacters was only as safe as the
+     *       quoting helper. No SQL text is produced at all now.</li>
+     *   <li><b>Predicate size.</b> The predicate grew O(N) with the number of deleted keys, so a
+     *       large flush produced a multi-megabyte string that had to be parsed and planned. The
+     *       keys now travel as a columnar Arrow batch.</li>
+     *   <li><b>Type coverage.</b> {@code formatSqlValue} only handled the integral types, float,
+     *       double, boolean and VARCHAR; DATE/TIME/TIMESTAMP/DECIMAL/VARBINARY keys threw
+     *       {@code UnsupportedOperationException}. Encoding is now delegated to the same
+     *       {@link RowDataConverter} used for upserts, so every type the connector can write it
+     *       can also delete by.</li>
+     *   <li><b>Non-finite floats.</b> {@code NaN}/{@code Infinity} have no valid SQL literal and
+     *       needed an explicit rejection. As Arrow values they round-trip natively, so the
+     *       special case is gone.</li>
+     * </ul>
+     *
+     * <p>{@code WhenNotMatched.DoNothing} is essential: it makes a delete of an absent key a
+     * clean no-op instead of inserting the key-only probe row. Together with the per-key
+     * collapsing in {@link #flush} this keeps deletes idempotent under upstream replay.
      */
-    private void deleteRows(List<RowData> rows) {
-        String predicate = buildDeletePredicate(rows);
-        LOG.debug("Deleting rows with predicate: {}", predicate);
-        dataset.delete(predicate);
+    private void deleteRows(List<RowData> rows) throws IOException {
+        validateNoNullKeys(rows);
+
+        MergeInsertParams params = new MergeInsertParams(primaryKeys)
+                .withMatchedDelete()
+                .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing);
+
+        // Only the primary-key columns are sent. The converter looks vectors up by name and skips
+        // fields absent from the root, so a key-only root needs no separate conversion path.
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(keyArrowSchema, allocator)) {
+            converter.toVectorSchemaRoot(rows, root);
+            LOG.debug("Deleting {} row(s) by primary key {}", rows.size(), primaryKeys);
+            MergeInsertResult result =
+                    ArrowArrayStreams.mergeInsert(dataset, params, allocator, root);
+            adoptResultHandle(result, "delete");
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Failed to delete Lance rows by primary key", e);
+        }
     }
 
     /**
-     * Build a SQL predicate of the form {@code (k1 = v1 AND k2 = v2) OR (...)}.
+     * Reject NULL primary-key values before they reach the native layer.
+     *
+     * <p>Retained from the predicate-based implementation, but for a different reason. Under SQL
+     * semantics {@code col = NULL} is UNKNOWN, so a NULL key silently matched nothing. Under
+     * {@code mergeInsert} a NULL key would instead participate in join matching and could match
+     * other NULL-keyed rows, making the delete over-broad. Both behaviours are wrong, so the
+     * value is rejected outright and the failure is attributed to a named column.
      */
-    private String buildDeletePredicate(List<RowData> rows) {
-        List<String> ors = new ArrayList<>();
+    private void validateNoNullKeys(List<RowData> rows) {
+        List<String> fieldNames = rowType.getFieldNames();
         for (RowData row : rows) {
-            List<String> ands = new ArrayList<>();
             for (int keyIndex : keyIndices) {
-                String column = rowType.getFieldNames().get(keyIndex);
-                LogicalType type = rowType.getTypeAt(keyIndex);
-                Object value = RowDataFieldAccessor.readField(row, keyIndex, type);
-                if (value == null) {
-                    // NULL primary keys cannot participate in an equality predicate
-                    // (col = NULL is UNKNOWN in SQL, so the row would never be matched
-                    // and the delete would silently no-op). Reject explicitly.
+                if (row.isNullAt(keyIndex)) {
                     throw new IllegalStateException(
                             "NULL primary-key value is not supported for DELETE on column '"
-                                    + column + "'");
+                                    + fieldNames.get(keyIndex) + "'");
                 }
-                ands.add(column + " = " + formatSqlValue(value, type));
             }
-            ors.add("(" + String.join(" AND ", ands) + ")");
         }
-        return String.join(" OR ", ors);
     }
 
     /**
-     * Format a primary-key value as a Lance SQL literal.
+     * Adopt the post-merge dataset handle returned by {@code mergeInsert}.
+     *
+     * <p>{@code mergeInsert} does not mutate the handle it is invoked on: it commits a new dataset
+     * version and returns a <em>new</em> handle, leaving the original pinned to its old snapshot.
+     * Writes are not lost by ignoring the return value (Lance resolves each merge against the
+     * latest committed state), but the long-lived {@link #dataset} field would never observe its
+     * own prior flush — so any read through it, now or after a future refactor, would silently see
+     * stale data. Swapping the field keeps read-your-own-write correct.
+     *
+     * <p>The superseded handle is closed; failure to close is logged rather than propagated, since
+     * the merge itself has already been committed durably.
      */
-    private String formatSqlValue(Object value, LogicalType type) {
-        if (type instanceof TinyIntType || type instanceof SmallIntType
-                || type instanceof IntType || type instanceof BigIntType
-                || type instanceof BooleanType) {
-            return value.toString();
+    private void adoptResultHandle(MergeInsertResult result, String operation) {
+        if (result == null) {
+            return;
         }
-        if (type instanceof FloatType) {
-            float f = (Float) value;
-            if (!Float.isFinite(f)) {
-                throw new IllegalStateException(
-                        "Non-finite float primary-key value (" + f + ") is not supported for DELETE");
+        Dataset updated = result.dataset();
+        if (updated == null || updated == dataset) {
+            return;
+        }
+        Dataset superseded = dataset;
+        dataset = updated;
+        if (superseded != null) {
+            try {
+                superseded.close();
+            } catch (Exception e) {
+                LOG.warn("Failed to close superseded dataset handle after {}", operation, e);
             }
-            return Float.toString(f);
         }
-        if (type instanceof DoubleType) {
-            double d = (Double) value;
-            if (!Double.isFinite(d)) {
-                throw new IllegalStateException(
-                        "Non-finite double primary-key value (" + d + ") is not supported for DELETE");
-            }
-            return Double.toString(d);
-        }
-        if (type instanceof VarCharType) {
-            StringData stringData = (StringData) value;
-            return "'" + stringData.toString().replace("'", "''") + "'";
-        }
-        throw new UnsupportedOperationException(
-                "Unsupported primary-key type for delete predicate: " + type.getClass().getSimpleName());
     }
 
     /**

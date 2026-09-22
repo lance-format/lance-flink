@@ -34,7 +34,7 @@ import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -103,7 +103,8 @@ public class LanceAggregateSource extends RichParallelSourceFunction<RowData> {
         LOG.info("Aggregate info: {}", aggregateInfo);
 
         this.running = true;
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create(
+                "lance-aggregate-source", options.getArrowAllocatorMaxBytes());
 
         // Open Lance dataset
         String datasetPath = options.getPath();

@@ -28,7 +28,7 @@ import org.apache.flink.table.factories.FactoryUtil;
 import org.lance.namespace.LanceNamespace;
 
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -145,7 +145,7 @@ public class LanceNamespaceCatalogFactory implements CatalogFactory {
         try {
             Thread.currentThread()
                     .setContextClassLoader(LanceNamespaceCatalogFactory.class.getClassLoader());
-            BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            BufferAllocator allocator = LanceAllocators.create("lance-namespace-catalog");
             LanceNamespace namespace =
                     LanceNamespace.connect(impl, namespaceProps, allocator);
             return new LanceNamespaceCatalog(

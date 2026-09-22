@@ -34,7 +34,7 @@ import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -106,7 +106,8 @@ public class LanceInputFormat extends RichInputFormat<RowData, LanceSplit> {
             throw new IOException("Dataset path cannot be empty");
         }
 
-        BufferAllocator tempAllocator = new RootAllocator(Long.MAX_VALUE);
+        BufferAllocator tempAllocator = LanceAllocators.create(
+                "lance-input-format-probe", options.getArrowAllocatorMaxBytes());
         try {
             // Honor read.version / read.as-of-timestamp for time-travel reads (issue #5).
             Dataset tempDataset = LanceOpener.open(datasetPath, tempAllocator, options);
@@ -139,7 +140,8 @@ public class LanceInputFormat extends RichInputFormat<RowData, LanceSplit> {
     public void open(LanceSplit split) throws IOException {
         LOG.info("Opening split: {}", split);
         
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create(
+                "lance-input-format", options.getArrowAllocatorMaxBytes());
         this.reachedEnd = false;
         
         // Open dataset

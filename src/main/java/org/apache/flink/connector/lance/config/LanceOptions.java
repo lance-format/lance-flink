@@ -280,6 +280,22 @@ public class LanceOptions implements Serializable {
             .noDefaultValue()
             .withDescription("Lance data warehouse path (required)");
 
+    // ==================== Memory Configuration ====================
+
+    /**
+     * Upper bound in bytes for each Arrow allocator created by the connector.
+     *
+     * <p>Opt-in: when unset the allocator is unbounded, which is the historical behaviour. The
+     * bound applies per allocator instance (one per sink, source, catalog or index builder), so it
+     * caps a single component's blast radius rather than the connector's total footprint.
+     */
+    public static final ConfigOption<Long> ARROW_ALLOCATOR_MAX_BYTES = ConfigOptions
+            .key("arrow.allocator-max-bytes")
+            .longType()
+            .defaultValue(Long.MAX_VALUE)
+            .withDescription(
+                    "Maximum bytes each Arrow allocator may reserve. Defaults to unlimited.");
+
     // ==================== Write Mode Enum ====================
 
     /**
@@ -397,6 +413,7 @@ public class LanceOptions implements Serializable {
     private final String defaultDatabase;
     private final String warehouse;
     private final Map<String, String> hadoopConfig;
+    private final long arrowAllocatorMaxBytes;
 
     private LanceOptions(Builder builder) {
         this.path = builder.path;
@@ -427,6 +444,7 @@ public class LanceOptions implements Serializable {
         this.hadoopConfig = builder.hadoopConfig == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(builder.hadoopConfig));
+        this.arrowAllocatorMaxBytes = builder.arrowAllocatorMaxBytes;
     }
 
     // ==================== Getter Methods ====================
@@ -541,6 +559,14 @@ public class LanceOptions implements Serializable {
         return hadoopConfig;
     }
 
+    /**
+     * Upper bound in bytes for the Arrow allocator created by the component consuming these
+     * options. {@link Long#MAX_VALUE} means unbounded.
+     */
+    public long getArrowAllocatorMaxBytes() {
+        return arrowAllocatorMaxBytes;
+    }
+
     // ==================== Builder ====================
 
     public static Builder builder() {
@@ -615,6 +641,9 @@ public class LanceOptions implements Serializable {
             builder.warehouse(config.get(WAREHOUSE));
         }
 
+        // Memory configuration
+        builder.arrowAllocatorMaxBytes(config.get(ARROW_ALLOCATOR_MAX_BYTES));
+
         return builder.build();
     }
 
@@ -648,6 +677,16 @@ public class LanceOptions implements Serializable {
         private String defaultDatabase = "default";
         private String warehouse;
         private Map<String, String> hadoopConfig;
+        private long arrowAllocatorMaxBytes = Long.MAX_VALUE;
+
+        /**
+         * Bound the Arrow allocator to {@code maxBytes}. Non-positive values are normalised to
+         * unbounded so a misconfigured value degrades to the historical behaviour.
+         */
+        public Builder arrowAllocatorMaxBytes(long maxBytes) {
+            this.arrowAllocatorMaxBytes = maxBytes > 0 ? maxBytes : Long.MAX_VALUE;
+            return this;
+        }
 
         public Builder path(String path) {
             this.path = path;

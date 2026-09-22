@@ -30,8 +30,10 @@ import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.CatalogPartition;
 import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.catalog.Column;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.ResolvedCatalogTable;
+import org.apache.flink.table.catalog.TableChange;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.catalog.exceptions.DatabaseAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.DatabaseNotEmptyException;
@@ -54,7 +56,7 @@ import org.lance.Dataset;
 import org.lance.WriteParams;
 import org.lance.schema.ColumnAlteration;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
+import org.apache.flink.connector.lance.util.LanceAllocators;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -106,12 +108,6 @@ public class LanceCatalog extends AbstractCatalog {
     private static final Logger LOG = LoggerFactory.getLogger(LanceCatalog.class);
 
     public static final String DEFAULT_DATABASE = "default";
-
-    /** Option keys that are connector/runtime configuration rather than user TBLPROPERTIES. */
-    private static final Set<String> RESERVED_OPTION_KEYS = Collections.unmodifiableSet(
-            new HashSet<>(java.util.Arrays.asList(
-                    "connector", "path",
-                    "s3-access-key", "s3-secret-key", "s3-region", "s3-endpoint")));
 
     private final String warehouse;
     private final Map<String, String> storageOptions;
@@ -182,7 +178,7 @@ public class LanceCatalog extends AbstractCatalog {
     public void open() throws CatalogException {
         LOG.info("Opening Lance Catalog: {}, warehouse path: {}, remote storage: {}", getName(), warehouse, isRemoteStorage);
         
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.allocator = LanceAllocators.create("lance-catalog", storageOptions);
         
         if (isRemoteStorage) {
             // Remote storage: initialize default database record
@@ -610,6 +606,164 @@ public class LanceCatalog extends AbstractCatalog {
         LOG.info("Created table: {} (primary keys: {})", tablePath, primaryKeys);
     }
 
+    /**
+     * Primary {@code ALTER TABLE} entry point: applies the planner's explicit {@link TableChange}
+     * list instead of reconstructing intent from a schema diff.
+     *
+     * <p>Flink passes the exact DDL operations the user wrote, so {@code RENAME COLUMN a TO b} is
+     * received as {@link TableChange.ModifyColumnName} rather than inferred from a coincidental
+     * remove/add pairing. That removes the central hazard of the diff-based path: a
+     * {@code DROP COLUMN a} followed by {@code ADD COLUMN a <other type>} at the same position is
+     * indistinguishable from a rename by position matching alone, and guessing wrong retains the
+     * old column's data under a new name.
+     *
+     * <p>Ordering matters and is deliberate: renames, then drops, then adds. Renames run first so
+     * they resolve against the names the user wrote. Drops must precede adds because re-creating a
+     * column under a name that still exists is rejected by Lance as a type conflict — which is
+     * exactly the {@code DROP score DOUBLE} / {@code ADD score STRING} case this path is meant to
+     * support. Adds run last for the same reason.
+     *
+     * <p>The {@code (ObjectPath, CatalogBaseTable, boolean)} overload remains as a fallback for
+     * callers that do not supply changes; see
+     * {@link #alterTable(ObjectPath, CatalogBaseTable, boolean)}.
+     */
+    @Override
+    public void alterTable(
+            ObjectPath tablePath,
+            CatalogBaseTable newTable,
+            List<TableChange> tableChanges,
+            boolean ignoreIfNotExists)
+            throws TableNotExistException, CatalogException {
+
+        if (tableChanges == null || tableChanges.isEmpty()) {
+            // Nothing explicit to apply; fall back to the diff-based path so behaviour is
+            // unchanged for callers that do not provide changes.
+            alterTable(tablePath, newTable, ignoreIfNotExists);
+            return;
+        }
+
+        if (!tableExists(tablePath)) {
+            if (!ignoreIfNotExists) {
+                throw new TableNotExistException(getName(), tablePath);
+            }
+            return;
+        }
+
+        String datasetPath = getDatasetPath(tablePath);
+        if (isRemoteStorage) {
+            configureStorageEnvironment();
+        }
+
+        try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+            List<ColumnAlteration> renames = new ArrayList<>();
+            List<Field> additions = new ArrayList<>();
+            List<String> drops = new ArrayList<>();
+            Map<String, String> optionsToSet = new HashMap<>();
+            Set<String> optionsToReset = new HashSet<>();
+
+            for (TableChange change : tableChanges) {
+                if (change instanceof TableChange.AddColumn) {
+                    Column column = ((TableChange.AddColumn) change).getColumn();
+                    if (!column.isPhysical()) {
+                        throw new CatalogException(
+                                "Only physical columns can be added to a Lance table; '"
+                                        + column.getName() + "' is computed or metadata");
+                    }
+                    additions.add(LanceTypeConverter.flinkTypeToArrowField(
+                            column.getName(), column.getDataType().getLogicalType()));
+                } else if (change instanceof TableChange.DropColumn) {
+                    drops.add(((TableChange.DropColumn) change).getColumnName());
+                } else if (change instanceof TableChange.ModifyColumnName) {
+                    TableChange.ModifyColumnName rename = (TableChange.ModifyColumnName) change;
+                    renames.add(new ColumnAlteration.Builder(rename.getOldColumnName())
+                            .rename(rename.getNewColumnName())
+                            .build());
+                } else if (change instanceof TableChange.ModifyPhysicalColumnType) {
+                    // Lance Java SDK castTo is verified to be a silent no-op, so accepting this
+                    // would report success while leaving the stored type unchanged.
+                    throw new CatalogException(
+                            "ALTER COLUMN data type change is not supported yet "
+                                    + "(Lance Java SDK castTo is unreliable). Change: " + change);
+                } else if (change instanceof TableChange.SetOption) {
+                    TableChange.SetOption set = (TableChange.SetOption) change;
+                    if (LanceOptionRegistry.isTblProperty(set.getKey())) {
+                        optionsToSet.put(set.getKey(), set.getValue());
+                    }
+                } else if (change instanceof TableChange.ResetOption) {
+                    String key = ((TableChange.ResetOption) change).getKey();
+                    if (LanceOptionRegistry.isTblProperty(key)) {
+                        optionsToReset.add(key);
+                    }
+                } else {
+                    throw new CatalogException(
+                            "Unsupported ALTER TABLE operation for Lance: " + change);
+                }
+            }
+
+            if (!renames.isEmpty()) {
+                dataset.alterColumns(renames);
+            }
+            if (!drops.isEmpty()) {
+                dataset.dropColumns(drops);
+            }
+            if (!additions.isEmpty()) {
+                dataset.addColumns(additions);
+            }
+
+            applyExplicitOptionChanges(dataset, optionsToSet, optionsToReset);
+
+            LOG.info("Altered table {} via {} explicit change(s): renamed={}, added={}, dropped={}",
+                    tablePath, tableChanges.size(), renames.size(), additions.size(), drops.size());
+        } catch (CatalogException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new CatalogException("Failed to alter table: " + tablePath, e);
+        }
+    }
+
+    /**
+     * Apply exactly the option changes the user requested.
+     *
+     * <p>Unlike {@link #applyTableProperties}, which must infer removals by comparing the new
+     * option map against the stored config, a RESET arrives here as an explicit key. Only those
+     * keys are deleted, so no ownership heuristic is needed and foreign engines' config is
+     * untouched by construction. Connector-managed metadata is still refused explicitly.
+     */
+    private void applyExplicitOptionChanges(
+            Dataset dataset, Map<String, String> toSet, Set<String> toReset) {
+        if (!toSet.isEmpty()) {
+            dataset.updateConfig(toSet);
+        }
+        if (toReset.isEmpty()) {
+            return;
+        }
+        Set<String> deletable = new HashSet<>();
+        Set<String> existing = dataset.getConfig().keySet();
+        for (String key : toReset) {
+            if (PrimaryKeyPersistence.PK_CONFIG_KEY.equals(key)) {
+                throw new CatalogException(
+                        "Cannot RESET connector-managed property '" + key + "'");
+            }
+            // Lance rejects deletion of absent keys on some paths; skipping them keeps RESET of a
+            // never-set property a no-op rather than an error.
+            if (existing.contains(key)) {
+                deletable.add(key);
+            }
+        }
+        if (!deletable.isEmpty()) {
+            dataset.deleteConfigKeys(deletable);
+        }
+    }
+
+    /**
+     * Fallback {@code ALTER TABLE} path used when no {@link TableChange} list is supplied.
+     *
+     * <p>Infers intent by diffing the stored schema against the requested one. This cannot
+     * reliably separate a rename from a positionally-aligned drop+add, so {@link SchemaDiff}
+     * refuses ambiguous diffs rather than guessing. Prefer
+     * {@link #alterTable(ObjectPath, CatalogBaseTable, List, boolean)}, which receives the user's
+     * actual operations.
+     */
     @Override
     public void alterTable(ObjectPath tablePath, CatalogBaseTable newTable, boolean ignoreIfNotExists)
             throws TableNotExistException, CatalogException {
@@ -735,27 +889,24 @@ public class LanceCatalog extends AbstractCatalog {
             dataset.updateConfig(toSet);
         }
 
-        // UNSET is applied conservatively: we only remove keys that Flink itself might have
-        // written. Any config key using a namespaced form ("engine.category.name") is treated
-        // as potentially owned by a sister engine (Spark / Trino / Ray) and left untouched,
-        // even if it looks like a user TBLPROPERTY by our own classifier. Keys the user
-        // explicitly re-sets in this ALTER stay writable via the toSet path above.
-        //
-        // TODO(follow-up A7): move to a "Flink writes under flink.* namespace only" model so
-        // this heuristic can be replaced with an exact prefix match.
+        // UNSET removes only keys Flink owns: those under the "flink." namespace and unnamespaced
+        // keys set through Flink DDL. Any other dotted key belongs to a sibling engine
+        // (Spark / Trino / Ray) and is left untouched, so a Flink RESET can never delete foreign
+        // metadata. Keys the user explicitly re-sets in this ALTER stay writable via toSet above.
         Set<String> toUnset = new HashSet<>();
         for (String key : dataset.getConfig().keySet()) {
             if (PrimaryKeyPersistence.PK_CONFIG_KEY.equals(key)) {
+                // Connector-managed metadata, not user DDL state.
                 continue;
             }
-            if (!isTblProperty(key)) {
+            if (!LanceOptionRegistry.isTblProperty(key)) {
                 continue;
             }
             if (options.containsKey(key)) {
                 continue;
             }
-            if (isForeignNamespacedKey(key)) {
-                LOG.debug("Skipping UNSET of foreign-namespaced config key: {}", key);
+            if (!LanceOptionRegistry.isFlinkOwnedConfigKey(key)) {
+                LOG.debug("Skipping UNSET of config key not owned by Flink: {}", key);
                 continue;
             }
             toUnset.add(key);
@@ -765,30 +916,8 @@ public class LanceCatalog extends AbstractCatalog {
         }
     }
 
-    /**
-     * Whether the given config key looks like it was written by another engine (Spark, Trino,
-     * Ray, ...). We use a simple heuristic: a key containing a dot ({@code engine.some.prop})
-     * is treated as namespaced and therefore not ours to delete. The Flink primary-key metadata
-     * key ({@link PrimaryKeyPersistence#PK_CONFIG_KEY}) is filtered separately by the caller.
-     */
-    private static boolean isForeignNamespacedKey(String key) {
-        return key != null && key.indexOf('.') >= 0;
-    }
-
     private boolean isTblProperty(String key) {
-        if (key == null) {
-            return false;
-        }
-        if (RESERVED_OPTION_KEYS.contains(key)) {
-            return false;
-        }
-        if (key.startsWith("hadoop.")) {
-            return false;
-        }
-        return !key.startsWith("read.")
-                && !key.startsWith("write.")
-                && !key.startsWith("index.")
-                && !key.startsWith("vector.");
+        return LanceOptionRegistry.isTblProperty(key);
     }
 
     // ==================== Partition Operations (Lance does not support partitions) ====================
