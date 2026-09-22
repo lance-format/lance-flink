@@ -1,0 +1,4 @@
+nav:
+  - DDL: ddl
+  - DQL: dql
+  - DML: dml

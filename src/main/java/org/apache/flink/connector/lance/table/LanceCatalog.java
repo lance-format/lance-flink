@@ -18,6 +18,7 @@
 
 package org.apache.flink.connector.lance.table;
 
+import org.apache.flink.connector.lance.PrimaryKeyPersistence;
 import org.apache.flink.connector.lance.converter.LanceTypeConverter;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
@@ -50,8 +51,11 @@ import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.lance.Dataset;
+import org.lance.WriteParams;
+import org.lance.schema.ColumnAlteration;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,6 +106,12 @@ public class LanceCatalog extends AbstractCatalog {
     private static final Logger LOG = LoggerFactory.getLogger(LanceCatalog.class);
 
     public static final String DEFAULT_DATABASE = "default";
+
+    /** Option keys that are connector/runtime configuration rather than user TBLPROPERTIES. */
+    private static final Set<String> RESERVED_OPTION_KEYS = Collections.unmodifiableSet(
+            new HashSet<>(java.util.Arrays.asList(
+                    "connector", "path",
+                    "s3-access-key", "s3-secret-key", "s3-region", "s3-endpoint")));
 
     private final String warehouse;
     private final Map<String, String> storageOptions;
@@ -434,7 +444,13 @@ public class LanceCatalog extends AbstractCatalog {
                     DataType dataType = LanceTypeConverter.toDataType(field.getType());
                     schemaBuilder.column(field.getName(), dataType);
                 }
-                
+
+                // Restore the primary key persisted in the dataset config.
+                List<String> primaryKeys = PrimaryKeyPersistence.load(dataset);
+                if (!primaryKeys.isEmpty()) {
+                    schemaBuilder.primaryKey(primaryKeys);
+                }
+
                 Map<String, String> options = new HashMap<>();
                 options.put("connector", LanceDynamicTableFactory.IDENTIFIER);
                 options.put("path", datasetPath);
@@ -566,16 +582,32 @@ public class LanceCatalog extends AbstractCatalog {
             }
             return;
         }
-        
+
+        RowType rowType = resolveRowType(table);
+        org.apache.arrow.vector.types.pojo.Schema arrowSchema =
+                LanceTypeConverter.toArrowSchema(rowType);
+        List<String> primaryKeys = extractPrimaryKeys(table);
+
+        String datasetPath = getDatasetPath(tablePath);
         if (isRemoteStorage) {
-            // Remote storage: record table info, actual creation on write
+            configureStorageEnvironment();
+        }
+
+        // Materialize an empty dataset immediately (matching the community Spark/Trino behavior),
+        // so the schema and primary-key metadata survive a catalog round-trip before any write.
+        try (Dataset dataset = Dataset.create(
+                allocator, datasetPath, arrowSchema, new WriteParams.Builder().build())) {
+            PrimaryKeyPersistence.persist(dataset, primaryKeys);
+        } catch (Exception e) {
+            throw new CatalogException("Failed to create table: " + tablePath, e);
+        }
+
+        if (isRemoteStorage) {
             String tableKey = tablePath.getDatabaseName() + "/" + tablePath.getObjectName();
             knownTables.add(tableKey);
         }
-        
-        // Actual table creation happens on first write
-        // Only record table metadata here
-        LOG.info("Registered table: {} (actual dataset will be created on write)", tablePath);
+
+        LOG.info("Created table: {} (primary keys: {})", tablePath, primaryKeys);
     }
 
     @Override
@@ -587,9 +619,150 @@ public class LanceCatalog extends AbstractCatalog {
             }
             return;
         }
-        
-        // Lance does not support modifying table structure
-        throw new CatalogException("Lance Catalog does not support altering table structure");
+
+        String datasetPath = getDatasetPath(tablePath);
+        if (isRemoteStorage) {
+            configureStorageEnvironment();
+        }
+
+        try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+            RowType newRowType = resolveRowType(newTable);
+            RowType oldRowType = LanceTypeConverter.toFlinkRowType(dataset.getSchema());
+
+            SchemaDiff diff = SchemaDiff.compute(oldRowType, newRowType);
+
+            // Data-type changes are rejected: Lance Java SDK 7.0.0's castTo is verified not to
+            // mutate the schema (a silent no-op), so supporting it would be a correctness hazard.
+            if (diff.hasTypeChanges()) {
+                List<String> affected = new ArrayList<>(diff.getTypeChangedColumns());
+                for (SchemaDiff.Rename rename : diff.getRenames()) {
+                    if (rename.getNewType() != null) {
+                        affected.add(rename.getNewName());
+                    }
+                }
+                throw new CatalogException(
+                        "ALTER COLUMN data type change is not supported yet (Lance Java SDK castTo is unreliable). Affected columns: "
+                                + affected);
+            }
+
+            // Pure renames are metadata-only and reliable.
+            List<ColumnAlteration> alterations = new ArrayList<>();
+            for (SchemaDiff.Rename rename : diff.getRenames()) {
+                alterations.add(new ColumnAlteration.Builder(rename.getOldName())
+                        .rename(rename.getNewName())
+                        .build());
+            }
+            if (!alterations.isEmpty()) {
+                dataset.alterColumns(alterations);
+            }
+
+            if (!diff.getAddedColumns().isEmpty()) {
+                List<Field> fields = new ArrayList<>();
+                for (RowType.RowField added : diff.getAddedColumns()) {
+                    fields.add(LanceTypeConverter.flinkTypeToArrowField(added.getName(), added.getType()));
+                }
+                dataset.addColumns(fields);
+            }
+
+            if (!diff.getDroppedColumns().isEmpty()) {
+                dataset.dropColumns(diff.getDroppedColumns());
+            }
+
+            applyTableProperties(dataset, newTable);
+
+            LOG.info("Altered table: {} (added={}, dropped={})",
+                    tablePath, diff.getAddedColumns().size(), diff.getDroppedColumns().size());
+        } catch (CatalogException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new CatalogException("Failed to alter table: " + tablePath, e);
+        }
+    }
+
+    /**
+     * Build a physical {@link RowType} from a table's unresolved schema, skipping computed and
+     * metadata columns.
+     */
+    private RowType resolveRowType(CatalogBaseTable table) {
+        List<RowType.RowField> fields = new ArrayList<>();
+        for (Schema.UnresolvedColumn column : table.getUnresolvedSchema().getColumns()) {
+            if (!(column instanceof Schema.UnresolvedPhysicalColumn)) {
+                continue;
+            }
+            Schema.UnresolvedPhysicalColumn physical = (Schema.UnresolvedPhysicalColumn) column;
+            if (!(physical.getDataType() instanceof DataType)) {
+                throw new CatalogException(
+                        "Column '" + physical.getName() + "' has an unresolved data type");
+            }
+            DataType dataType = (DataType) physical.getDataType();
+            fields.add(new RowType.RowField(physical.getName(), dataType.getLogicalType()));
+        }
+        if (fields.isEmpty()) {
+            throw new CatalogException("Cannot create or alter a Lance table without physical columns");
+        }
+        return new RowType(fields);
+    }
+
+    /**
+     * Extract the {@code PRIMARY KEY ... NOT ENFORCED} column names from the table's schema.
+     *
+     * <p>The catalog receives an unresolved schema on the SQL DDL path, whose primary key is
+     * represented by {@link Schema.UnresolvedPrimaryKey}; the resolved variant
+     * ({@code UniqueConstraint}) is only available once the schema has been resolved, so this
+     * deliberately reads the unresolved form.
+     */
+    private List<String> extractPrimaryKeys(CatalogBaseTable table) {
+        return table.getUnresolvedSchema()
+                .getPrimaryKey()
+                .map(Schema.UnresolvedPrimaryKey::getColumnNames)
+                .orElse(Collections.emptyList());
+    }
+
+    /**
+     * Apply {@code SET}/{@code UNSET} TBLPROPERTIES by syncing non-connector options into the
+     * Lance dataset config (and removing config keys absent from the new options).
+     */
+    private void applyTableProperties(Dataset dataset, CatalogBaseTable newTable) {
+        Map<String, String> options = newTable.getOptions();
+
+        Map<String, String> toSet = new HashMap<>();
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            if (isTblProperty(entry.getKey())) {
+                toSet.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (!toSet.isEmpty()) {
+            dataset.updateConfig(toSet);
+        }
+
+        Set<String> toUnset = new HashSet<>();
+        for (String key : dataset.getConfig().keySet()) {
+            if (PrimaryKeyPersistence.PK_CONFIG_KEY.equals(key)) {
+                continue;
+            }
+            if (isTblProperty(key) && !options.containsKey(key)) {
+                toUnset.add(key);
+            }
+        }
+        if (!toUnset.isEmpty()) {
+            dataset.deleteConfigKeys(toUnset);
+        }
+    }
+
+    private boolean isTblProperty(String key) {
+        if (key == null) {
+            return false;
+        }
+        if (RESERVED_OPTION_KEYS.contains(key)) {
+            return false;
+        }
+        if (key.startsWith("hadoop.")) {
+            return false;
+        }
+        return !key.startsWith("read.")
+                && !key.startsWith("write.")
+                && !key.startsWith("index.")
+                && !key.startsWith("vector.");
     }
 
     // ==================== Partition Operations (Lance does not support partitions) ====================

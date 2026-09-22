@@ -22,14 +22,20 @@ import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.connector.lance.config.LanceOptions;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.catalog.UniqueConstraint;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.factories.DynamicTableSinkFactory;
 import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.Preconditions;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -210,10 +216,44 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
 
+        ResolvedSchema schema = context.getCatalogTable().getResolvedSchema();
+        List<String> primaryKeys = extractPrimaryKeys(schema);
+        int[] primaryKeyIndices = resolvePrimaryKeyIndices(schema, primaryKeys);
+
         return new LanceDynamicTableSink(
                 options,
-                context.getCatalogTable().getResolvedSchema().toPhysicalRowDataType()
+                schema.toPhysicalRowDataType(),
+                primaryKeys,
+                primaryKeyIndices
         );
+    }
+
+    /**
+     * Extract the {@code PRIMARY KEY ... NOT ENFORCED} column names from the resolved schema.
+     */
+    private List<String> extractPrimaryKeys(ResolvedSchema schema) {
+        return schema.getPrimaryKey()
+                .map(UniqueConstraint::getColumns)
+                .orElse(Collections.emptyList());
+    }
+
+    /**
+     * Resolve primary-key column names to physical column indices.
+     */
+    private int[] resolvePrimaryKeyIndices(ResolvedSchema schema, List<String> primaryKeys) {
+        if (primaryKeys.isEmpty()) {
+            return new int[0];
+        }
+        RowType rowType = (RowType) schema.toPhysicalRowDataType().getLogicalType();
+        List<String> fieldNames = rowType.getFieldNames();
+        int[] indices = new int[primaryKeys.size()];
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            int idx = fieldNames.indexOf(primaryKeys.get(i));
+            Preconditions.checkArgument(
+                    idx >= 0, "Primary key column '%s' not found in schema", primaryKeys.get(i));
+            indices[i] = idx;
+        }
+        return indices;
     }
 
     /**

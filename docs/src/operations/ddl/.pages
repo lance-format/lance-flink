@@ -1,0 +1,3 @@
+nav:
+  - CREATE CATALOG: create-catalog.md
+  - CREATE TABLE: create-table.md
