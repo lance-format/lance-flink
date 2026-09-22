@@ -19,6 +19,7 @@
 package org.apache.flink.connector.lance.converter;
 
 import org.apache.flink.table.data.ArrayData;
+import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericArrayData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -29,12 +30,15 @@ import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DateType;
+import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
+import org.apache.flink.table.types.logical.TimeType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarBinaryType;
@@ -44,15 +48,24 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeMicroVector;
+import org.apache.arrow.vector.TimeMilliVector;
+import org.apache.arrow.vector.TimeNanoVector;
+import org.apache.arrow.vector.TimeSecVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
+import org.apache.arrow.vector.TimeStampMilliTZVector;
 import org.apache.arrow.vector.TimeStampMilliVector;
+import org.apache.arrow.vector.TimeStampNanoTZVector;
 import org.apache.arrow.vector.TimeStampNanoVector;
+import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.TimeStampSecVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
@@ -66,6 +79,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -197,8 +211,17 @@ public class RowDataConverter implements Serializable {
         } else if (logicalType instanceof DateType) {
             int daysSinceEpoch = ((DateDayVector) vector).get(index);
             return daysSinceEpoch;
+        } else if (logicalType instanceof TimeType) {
+            return readTime(vector, index);
         } else if (logicalType instanceof TimestampType) {
             return readTimestamp(vector, index, (TimestampType) logicalType);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            return readLocalZonedTimestamp(vector, index);
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            BigDecimal value = ((DecimalVector) vector).getObject(index);
+            return DecimalData.fromBigDecimal(
+                    value, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return readArray(vector, index, (ArrayType) logicalType);
         } else if (logicalType instanceof RowType) {
@@ -232,6 +255,53 @@ public class RowDataConverter implements Serializable {
 
         throw new LanceTypeConverter.UnsupportedTypeException(
                 "Unsupported timestamp Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
+     * Read a TIME value as milliseconds since midnight.
+     *
+     * <p>Flink represents TIME as an int holding milliseconds of the day, so the sub-millisecond
+     * units Arrow allows are narrowed down to that resolution here.
+     */
+    private int readTime(FieldVector vector, int index) {
+        if (vector instanceof TimeSecVector) {
+            return ((TimeSecVector) vector).get(index) * 1000;
+        } else if (vector instanceof TimeMilliVector) {
+            return ((TimeMilliVector) vector).get(index);
+        } else if (vector instanceof TimeMicroVector) {
+            return (int) (((TimeMicroVector) vector).get(index) / 1000L);
+        } else if (vector instanceof TimeNanoVector) {
+            return (int) (((TimeNanoVector) vector).get(index) / 1_000_000L);
+        }
+
+        throw new LanceTypeConverter.UnsupportedTypeException(
+                "Unsupported time Vector type: " + vector.getClass().getSimpleName());
+    }
+
+    /**
+     * Read a TIMESTAMP_LTZ value.
+     *
+     * <p>Arrow exposes zoned timestamps through dedicated *TZ vectors, so these are distinct
+     * classes from the ones {@link #readTimestamp} handles. Values are epoch-based, which is
+     * exactly what {@link TimestampData#fromEpochMillis} expects, so no zone shifting is applied.
+     */
+    private TimestampData readLocalZonedTimestamp(FieldVector vector, int index) {
+        if (vector instanceof TimeStampSecTZVector) {
+            return TimestampData.fromEpochMillis(((TimeStampSecTZVector) vector).get(index) * 1000L);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            return TimestampData.fromEpochMillis(((TimeStampMilliTZVector) vector).get(index));
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            long micros = ((TimeStampMicroTZVector) vector).get(index);
+            return TimestampData.fromEpochMillis(
+                    Math.floorDiv(micros, 1000L), (int) Math.floorMod(micros, 1000L) * 1000);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            long nanos = ((TimeStampNanoTZVector) vector).get(index);
+            return TimestampData.fromEpochMillis(
+                    Math.floorDiv(nanos, 1_000_000L), (int) Math.floorMod(nanos, 1_000_000L));
+        }
+
+        throw new LanceTypeConverter.UnsupportedTypeException(
+                "Unsupported zoned timestamp Vector type: " + vector.getClass().getSimpleName());
     }
 
     /**
@@ -376,9 +446,17 @@ public class RowDataConverter implements Serializable {
             return rowData.getBinary(index);
         } else if (logicalType instanceof DateType) {
             return rowData.getInt(index);
+        } else if (logicalType instanceof TimeType) {
+            return rowData.getInt(index);
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             return rowData.getTimestamp(index, tsType.getPrecision());
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            return rowData.getTimestamp(index, ltzType.getPrecision());
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            return rowData.getDecimal(index, decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             return rowData.getArray(index);
         } else if (logicalType instanceof RowType) {
@@ -422,8 +500,14 @@ public class RowDataConverter implements Serializable {
             ((FixedSizeBinaryVector) vector).setSafe(index, (byte[]) value);
         } else if (logicalType instanceof DateType) {
             ((DateDayVector) vector).setSafe(index, (int) value);
+        } else if (logicalType instanceof TimeType) {
+            writeTime(vector, index, (int) value);
         } else if (logicalType instanceof TimestampType) {
             writeTimestamp(vector, index, (TimestampData) value, (TimestampType) logicalType);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            writeLocalZonedTimestamp(vector, index, (TimestampData) value);
+        } else if (logicalType instanceof DecimalType) {
+            ((DecimalVector) vector).setSafe(index, ((DecimalData) value).toBigDecimal());
         } else if (logicalType instanceof ArrayType) {
             writeArray(vector, index, (ArrayData) value, (ArrayType) logicalType);
         } else if (logicalType instanceof RowType) {
@@ -468,6 +552,24 @@ public class RowDataConverter implements Serializable {
             ((TimeStampMicroVector) vector).setNull(index);
         } else if (vector instanceof TimeStampNanoVector) {
             ((TimeStampNanoVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampSecTZVector) {
+            ((TimeStampSecTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            ((TimeStampMilliTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            ((TimeStampMicroTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            ((TimeStampNanoTZVector) vector).setNull(index);
+        } else if (vector instanceof TimeSecVector) {
+            ((TimeSecVector) vector).setNull(index);
+        } else if (vector instanceof TimeMilliVector) {
+            ((TimeMilliVector) vector).setNull(index);
+        } else if (vector instanceof TimeMicroVector) {
+            ((TimeMicroVector) vector).setNull(index);
+        } else if (vector instanceof TimeNanoVector) {
+            ((TimeNanoVector) vector).setNull(index);
+        } else if (vector instanceof DecimalVector) {
+            ((DecimalVector) vector).setNull(index);
         } else if (vector instanceof FixedSizeListVector) {
             ((FixedSizeListVector) vector).setNull(index);
         } else if (vector instanceof ListVector) {
@@ -497,6 +599,51 @@ public class RowDataConverter implements Serializable {
         } else {
             throw new LanceTypeConverter.UnsupportedTypeException(
                     "Unsupported timestamp Vector type: " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Write a TIME value given as milliseconds since midnight.
+     *
+     * <p>The incoming value is always millisecond-resolution because that is Flink's internal
+     * representation, so the finer Arrow units are scaled up rather than truncated.
+     */
+    private void writeTime(FieldVector vector, int index, int millisOfDay) {
+        if (vector instanceof TimeSecVector) {
+            ((TimeSecVector) vector).setSafe(index, millisOfDay / 1000);
+        } else if (vector instanceof TimeMilliVector) {
+            ((TimeMilliVector) vector).setSafe(index, millisOfDay);
+        } else if (vector instanceof TimeMicroVector) {
+            ((TimeMicroVector) vector).setSafe(index, millisOfDay * 1000L);
+        } else if (vector instanceof TimeNanoVector) {
+            ((TimeNanoVector) vector).setSafe(index, millisOfDay * 1_000_000L);
+        } else {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported time Vector type: " + vector.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Write a TIMESTAMP_LTZ value into one of Arrow's zoned timestamp vectors.
+     *
+     * <p>{@link TimestampData} already holds an epoch-based instant for this type, so the value is
+     * written as-is; applying a zone offset here would shift the instant.
+     */
+    private void writeLocalZonedTimestamp(FieldVector vector, int index, TimestampData tsData) {
+        long millis = tsData.getMillisecond();
+        int nanos = tsData.getNanoOfMillisecond();
+
+        if (vector instanceof TimeStampSecTZVector) {
+            ((TimeStampSecTZVector) vector).setSafe(index, millis / 1000);
+        } else if (vector instanceof TimeStampMilliTZVector) {
+            ((TimeStampMilliTZVector) vector).setSafe(index, millis);
+        } else if (vector instanceof TimeStampMicroTZVector) {
+            ((TimeStampMicroTZVector) vector).setSafe(index, millis * 1000L + nanos / 1000);
+        } else if (vector instanceof TimeStampNanoTZVector) {
+            ((TimeStampNanoTZVector) vector).setSafe(index, millis * 1_000_000L + nanos);
+        } else {
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Unsupported zoned timestamp Vector type: " + vector.getClass().getSimpleName());
         }
     }
 

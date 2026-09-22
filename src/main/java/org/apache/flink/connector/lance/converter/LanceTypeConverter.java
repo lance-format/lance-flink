@@ -25,12 +25,15 @@ import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DateType;
+import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
+import org.apache.flink.table.types.logical.TimeType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarBinaryType;
@@ -65,7 +68,10 @@ import java.util.List;
  *   <li>Boolean <-> BOOLEAN</li>
  *   <li>Binary/LargeBinary <-> BYTES</li>
  *   <li>Date32 <-> DATE</li>
- *   <li>Timestamp <-> TIMESTAMP</li>
+ *   <li>Time32/Time64 <-> TIME</li>
+ *   <li>Timestamp (no timezone) <-> TIMESTAMP</li>
+ *   <li>Timestamp (UTC timezone) <-> TIMESTAMP_LTZ</li>
+ *   <li>Decimal128 <-> DECIMAL</li>
  *   <li>FixedSizeList<Float32> <-> ARRAY<FLOAT></li>
  *   <li>FixedSizeList<Float64> <-> ARRAY<DOUBLE></li>
  * </ul>
@@ -74,6 +80,14 @@ public class LanceTypeConverter implements Serializable {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(LanceTypeConverter.class);
+
+    /**
+     * Bit width used for Arrow decimals.
+     *
+     * <p>Flink's DECIMAL tops out at precision 38, which fits Decimal128, so widening to 256 is
+     * never required.
+     */
+    private static final int DECIMAL_BIT_WIDTH = 128;
 
     /**
      * Convert Arrow Schema to Flink RowType
@@ -154,11 +168,22 @@ public class LanceTypeConverter implements Serializable {
             return new BinaryType(nullable, fixedBinary.getByteWidth());
         } else if (arrowType instanceof ArrowType.Date) {
             return new DateType(nullable);
+        } else if (arrowType instanceof ArrowType.Time) {
+            ArrowType.Time timeType = (ArrowType.Time) arrowType;
+            return new TimeType(nullable, getTimestampPrecision(timeType.getUnit()));
         } else if (arrowType instanceof ArrowType.Timestamp) {
             ArrowType.Timestamp tsType = (ArrowType.Timestamp) arrowType;
             // Determine precision based on time unit
             int precision = getTimestampPrecision(tsType.getUnit());
+            // A timezone marks an absolute instant, which is TIMESTAMP_LTZ on the Flink side.
+            // Without this split the zoned and unzoned forms would collapse into one.
+            if (tsType.getTimezone() != null) {
+                return new LocalZonedTimestampType(nullable, precision);
+            }
             return new TimestampType(nullable, precision);
+        } else if (arrowType instanceof ArrowType.Decimal) {
+            ArrowType.Decimal decimalType = (ArrowType.Decimal) arrowType;
+            return new DecimalType(nullable, decimalType.getPrecision(), decimalType.getScale());
         } else if (arrowType instanceof ArrowType.FixedSizeList) {
             // Vector type: FixedSizeList<Float32/Float64>
             ArrowType.FixedSizeList listType = (ArrowType.FixedSizeList) arrowType;
@@ -228,10 +253,27 @@ public class LanceTypeConverter implements Serializable {
             arrowType = new ArrowType.FixedSizeBinary(binaryType.getLength());
         } else if (logicalType instanceof DateType) {
             arrowType = new ArrowType.Date(DateUnit.DAY);
+        } else if (logicalType instanceof TimeType) {
+            // Flink TIME is time-of-day without date. Arrow splits this across bit widths:
+            // Time32 carries SECOND/MILLISECOND, Time64 carries MICROSECOND/NANOSECOND.
+            TimeType timeType = (TimeType) logicalType;
+            TimeUnit timeUnit = getArrowTimeUnit(timeType.getPrecision());
+            arrowType = new ArrowType.Time(timeUnit, getTimeBitWidth(timeUnit));
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             TimeUnit timeUnit = getArrowTimeUnit(tsType.getPrecision());
             arrowType = new ArrowType.Timestamp(timeUnit, null);
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            // TIMESTAMP_LTZ denotes an absolute instant. Tagging the Arrow type with UTC keeps it
+            // distinguishable from a plain TIMESTAMP, which is what makes the round-trip lossless.
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            TimeUnit timeUnit = getArrowTimeUnit(ltzType.getPrecision());
+            arrowType = new ArrowType.Timestamp(timeUnit, "UTC");
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            arrowType =
+                    new ArrowType.Decimal(
+                            decimalType.getPrecision(), decimalType.getScale(), DECIMAL_BIT_WIDTH);
         } else if (logicalType instanceof ArrayType) {
             ArrayType arrayType = (ArrayType) logicalType;
             LogicalType elementType = arrayType.getElementType();
@@ -374,9 +416,17 @@ public class LanceTypeConverter implements Serializable {
             return DataTypes.BINARY(binaryType.getLength());
         } else if (logicalType instanceof DateType) {
             return DataTypes.DATE();
+        } else if (logicalType instanceof TimeType) {
+            return DataTypes.TIME(((TimeType) logicalType).getPrecision());
         } else if (logicalType instanceof TimestampType) {
             TimestampType tsType = (TimestampType) logicalType;
             return DataTypes.TIMESTAMP(tsType.getPrecision());
+        } else if (logicalType instanceof LocalZonedTimestampType) {
+            LocalZonedTimestampType ltzType = (LocalZonedTimestampType) logicalType;
+            return DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(ltzType.getPrecision());
+        } else if (logicalType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) logicalType;
+            return DataTypes.DECIMAL(decimalType.getPrecision(), decimalType.getScale());
         } else if (logicalType instanceof ArrayType) {
             ArrayType arrayType = (ArrayType) logicalType;
             DataType elementDataType = toDataType(arrayType.getElementType());
@@ -422,6 +472,22 @@ public class LanceTypeConverter implements Serializable {
             return TimeUnit.MICROSECOND;
         } else {
             return TimeUnit.NANOSECOND;
+        }
+    }
+
+    /**
+     * Get the Arrow Time bit width required by a time unit.
+     *
+     * <p>Arrow only allows Time32 for SECOND/MILLISECOND and Time64 for MICROSECOND/NANOSECOND;
+     * pairing a unit with the wrong width is rejected when the field is constructed.
+     */
+    private static int getTimeBitWidth(TimeUnit timeUnit) {
+        switch (timeUnit) {
+            case SECOND:
+            case MILLISECOND:
+                return 32;
+            default:
+                return 64;
         }
     }
 

@@ -166,13 +166,18 @@ class LanceNamespaceCatalogSchemaTest {
     @Test
     @DisplayName("An unsupported column type is rejected as a schema problem")
     void testUnsupportedTypeRejected() {
+        // MAP has no Arrow mapping yet. DECIMAL used to stand in here, so this case had to move
+        // when DECIMAL gained one; the assertion is about how an unmappable type is surfaced, not
+        // about MAP specifically.
         CatalogTable table = tableWith(
-                Schema.newBuilder().column("amount", DataTypes.DECIMAL(10, 2)).build());
+                Schema.newBuilder()
+                        .column("attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()))
+                        .build());
 
         assertThatThrownBy(() -> LanceNamespaceCatalog.toArrowIpcSchema(table, allocator))
                 .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
                 .hasMessageContaining("Cannot create a Lance table with this schema")
-                .hasMessageContaining("DecimalType");
+                .hasMessageContaining("MapType");
     }
 
     @Test
