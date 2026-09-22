@@ -44,10 +44,20 @@ import org.apache.flink.table.expressions.ValueLiteralExpression;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.types.RowKind;
 
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -61,6 +71,18 @@ import java.util.stream.Collectors;
 public class LanceDynamicTableSource implements ScanTableSource, 
         SupportsProjectionPushDown, SupportsFilterPushDown, SupportsLimitPushDown,
         SupportsAggregatePushDown {
+
+    /**
+     * Lance/DataFusion timestamp literals use a space between date and time, not the ISO
+     * {@code T}. Two formats are kept because an optional section in a single pattern is only
+     * optional when parsing — when formatting it always emits, padding an exact second out to
+     * {@code .000000000}.
+     */
+    private static final DateTimeFormatter TIMESTAMP_LITERAL_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final DateTimeFormatter TIMESTAMP_LITERAL_FORMAT_NANOS =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
 
     private final LanceOptions options;
     private final DataType physicalDataType;
@@ -273,24 +295,52 @@ public class LanceDynamicTableSource implements ScanTableSource,
         // IS NULL / IS NOT NULL
         else if (funcDef == BuiltInFunctionDefinitions.IS_NULL) {
             if (args.size() == 1 && args.get(0) instanceof FieldReferenceExpression) {
-                String fieldName = ((FieldReferenceExpression) args.get(0)).getName();
-                return fieldName + " IS NULL";
+                String fieldName = quoteIdentifier(((FieldReferenceExpression) args.get(0)).getName());
+                return fieldName == null ? null : fieldName + " IS NULL";
             }
         } else if (funcDef == BuiltInFunctionDefinitions.IS_NOT_NULL) {
             if (args.size() == 1 && args.get(0) instanceof FieldReferenceExpression) {
-                String fieldName = ((FieldReferenceExpression) args.get(0)).getName();
-                return fieldName + " IS NOT NULL";
+                String fieldName = quoteIdentifier(((FieldReferenceExpression) args.get(0)).getName());
+                return fieldName == null ? null : fieldName + " IS NOT NULL";
             }
         }
         // LIKE
         else if (funcDef == BuiltInFunctionDefinitions.LIKE) {
             return buildComparisonFilter(args, "LIKE");
         }
-        // IN (not supported yet, requires more complex handling)
-        // BETWEEN (not supported yet)
+        // Note: SQL IN and BETWEEN never reach here as their own FunctionDefinition. Calcite
+        // expands IN over a literal list into an OR chain, and BETWEEN into >= AND <=, while
+        // converting SQL to RelNode; RexNodeExtractor further expands any SEARCH/Sarg back into
+        // OR before the planner hands the conjuncts to applyFilters. Both therefore push down
+        // through the OR / AND / comparison branches above.
 
         // Unsupported functions, return null
         return null;
+    }
+
+    /**
+     * Quote a column name as a Lance SQL identifier.
+     *
+     * <p>Lance parses predicates as SQL, so an unquoted name containing a space, a special
+     * character, or a reserved word does not round-trip: {@code user name = 'x'} is two tokens,
+     * not one identifier. Backtick quoting is Lance's documented escape.
+     *
+     * <p>Returns {@code null} for names Lance cannot address at all, which makes the caller
+     * decline the push-down and leaves the filter to Flink:
+     * <ul>
+     *   <li>names containing {@code .} — documented as unsupported, since a dot is always read
+     *       as nested-field access and cannot be escaped;
+     *   <li>names containing a backtick, which would terminate the quoted identifier.
+     * </ul>
+     */
+    private String quoteIdentifier(String fieldName) {
+        if (fieldName == null || fieldName.isEmpty()) {
+            return null;
+        }
+        if (fieldName.indexOf('.') >= 0 || fieldName.indexOf('`') >= 0) {
+            return null;
+        }
+        return "`" + fieldName + "`";
     }
 
     /**
@@ -309,11 +359,13 @@ public class LanceDynamicTableSource implements ScanTableSource,
         String value = null;
 
         if (left instanceof FieldReferenceExpression) {
-            fieldName = ((FieldReferenceExpression) left).getName();
-            value = extractLiteralValue(right);
+            FieldReferenceExpression ref = (FieldReferenceExpression) left;
+            fieldName = quoteIdentifier(ref.getName());
+            value = extractLiteralValue(right, ref.getOutputDataType());
         } else if (right instanceof FieldReferenceExpression) {
-            fieldName = ((FieldReferenceExpression) right).getName();
-            value = extractLiteralValue(left);
+            FieldReferenceExpression ref = (FieldReferenceExpression) right;
+            fieldName = quoteIdentifier(ref.getName());
+            value = extractLiteralValue(left, ref.getOutputDataType());
             // For asymmetric operators, need to swap operator
             if (">".equals(operator)) operator = "<";
             else if ("<".equals(operator)) operator = ">";
@@ -344,30 +396,109 @@ public class LanceDynamicTableSource implements ScanTableSource,
     }
 
     /**
-     * Extract literal value from ValueLiteralExpression
+     * Render a literal into a Lance predicate fragment, using the compared column's type to pick
+     * the right syntax.
+     *
+     * <p>Lance parses predicates with DataFusion, where temporal and decimal literals must carry a
+     * type prefix ({@code date '2021-01-01'}, {@code timestamp '2021-01-01 00:00:00'}). A bare
+     * quoted string is a Utf8 literal and comparing it against a Date32 / Timestamp column does
+     * not mean the same thing, so the previous {@code toString()} catch-all produced predicates
+     * that were silently wrong rather than rejected.
+     *
+     * <p>Returns {@code null} when the value cannot be expressed faithfully; the caller then
+     * declines the push-down and Flink evaluates the filter itself. Returning {@code null} is
+     * always safe. Emitting a guess is not.
+     *
+     * @param expr the literal side of the comparison
+     * @param columnType type of the column it is compared against, used to select literal syntax
      */
-    private String extractLiteralValue(ResolvedExpression expr) {
-        if (expr instanceof ValueLiteralExpression) {
-            ValueLiteralExpression literal = (ValueLiteralExpression) expr;
-            Object value = literal.getValueAs(Object.class).orElse(null);
-            
-            if (value == null) {
-                return "NULL";
-            } else if (value instanceof String) {
-                // Strings need single quotes and escape internal single quotes
-                String strValue = (String) value;
-                strValue = strValue.replace("'", "''");
-                return "'" + strValue + "'";
-            } else if (value instanceof Number) {
-                return value.toString();
-            } else if (value instanceof Boolean) {
-                return value.toString().toUpperCase();
-            } else {
-                // Other types try to convert to string
-                return "'" + value.toString().replace("'", "''") + "'";
-            }
+    private String extractLiteralValue(ResolvedExpression expr, DataType columnType) {
+        if (!(expr instanceof ValueLiteralExpression)) {
+            return null;
         }
+        ValueLiteralExpression literal = (ValueLiteralExpression) expr;
+        Object value = literal.getValueAs(Object.class).orElse(null);
+
+        if (value == null) {
+            return "NULL";
+        }
+
+        LogicalType target = columnType == null ? null : columnType.getLogicalType();
+        LogicalTypeRoot root = target == null ? null : target.getTypeRoot();
+
+        if (root == LogicalTypeRoot.DATE) {
+            return literal.getValueAs(LocalDate.class)
+                    .map(d -> "date '" + d + "'")
+                    .orElse(null);
+        }
+        if (root == LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE
+                || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
+            return renderTimestamp(literal, target);
+        }
+        if (root == LogicalTypeRoot.TIME_WITHOUT_TIME_ZONE) {
+            // DataFusion has no documented `time '...'` literal form in Lance's filter grammar.
+            return null;
+        }
+
+        if (value instanceof String) {
+            return "'" + ((String) value).replace("'", "''") + "'";
+        }
+        if (value instanceof Boolean) {
+            return value.toString().toUpperCase();
+        }
+        if (value instanceof BigDecimal) {
+            BigDecimal decimal = (BigDecimal) value;
+            if (target instanceof DecimalType) {
+                DecimalType decimalType = (DecimalType) target;
+                return "decimal(" + decimalType.getPrecision() + "," + decimalType.getScale()
+                        + ") '" + decimal.toPlainString() + "'";
+            }
+            return decimal.toPlainString();
+        }
+        if (value instanceof Double || value instanceof Float) {
+            double d = ((Number) value).doubleValue();
+            if (Double.isNaN(d) || Double.isInfinite(d)) {
+                // `x = NaN` is not parseable, and NaN never compares equal anyway.
+                return null;
+            }
+            return value.toString();
+        }
+        if (value instanceof Number) {
+            return value.toString();
+        }
+
+        // Unknown carrier type: previously stringified via toString(). Decline instead.
         return null;
+    }
+
+    /**
+     * Render a {@code timestamp} literal. Lance accepts an optional precision parameter matching
+     * the column's declared precision; the literal text must use a space separator rather than
+     * the ISO {@code T} that {@link LocalDateTime#toString()} emits.
+     */
+    private String renderTimestamp(ValueLiteralExpression literal, LogicalType target) {
+        LocalDateTime dateTime = literal.getValueAs(LocalDateTime.class).orElse(null);
+        if (dateTime == null) {
+            Instant instant = literal.getValueAs(Instant.class).orElse(null);
+            if (instant == null) {
+                return null;
+            }
+            dateTime = LocalDateTime.ofInstant(instant, ZoneOffset.UTC);
+        }
+
+        int precision;
+        if (target instanceof TimestampType) {
+            precision = ((TimestampType) target).getPrecision();
+        } else if (target instanceof LocalZonedTimestampType) {
+            precision = ((LocalZonedTimestampType) target).getPrecision();
+        } else {
+            precision = 6;
+        }
+
+        String rendered = dateTime.getNano() == 0
+                ? dateTime.format(TIMESTAMP_LITERAL_FORMAT)
+                : dateTime.format(TIMESTAMP_LITERAL_FORMAT_NANOS);
+        return "timestamp(" + precision + ") '" + rendered + "'";
     }
 
     /**
