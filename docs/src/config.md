@@ -30,6 +30,16 @@ catalog types are `'lance'` (directory/S3) and `'lance-namespace'` (dir/rest).
 | `write.batch-size` | ❌ | 1024 | Write batch size |
 | `write.mode` | ❌ | append | `append` or `overwrite` |
 | `write.max-rows-per-file` | ❌ | 1000000 | Maximum rows per data file |
+| `write.data-storage-version` | ❌ | *(SDK default)* | Lance file format version for written data files, e.g. `2.2`. A `MAP` column requires 2.2+. Fixed when the dataset is created — changing it later does not upgrade an existing dataset. |
+
+Leaving `write.data-storage-version` unset lets the Lance SDK choose, which is
+why it has no default here: pinning today's default would hold the connector
+back once the SDK moves forward.
+
+Some Arrow types are gated on this version. A `MAP` column is accepted into the
+schema at `CREATE TABLE` on any version, but writing rows fails inside the Lance
+encoder below 2.2 — so set the option at table creation, not after the first
+write attempt.
 
 ### Vector index
 

@@ -117,6 +117,13 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
             .defaultValue(1000000)
             .withDescription("Maximum rows per file");
 
+    public static final ConfigOption<String> WRITE_DATA_STORAGE_VERSION = ConfigOptions
+            .key("write.data-storage-version")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Lance file format version for written data files, e.g. '2.2'. "
+                    + "Unset leaves the choice to the Lance SDK. A MAP column requires 2.2+.");
+
     public static final ConfigOption<String> INDEX_TYPE = ConfigOptions
             .key("index.type")
             .stringType()
@@ -182,6 +189,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         options.add(WRITE_BATCH_SIZE);
         options.add(WRITE_MODE);
         options.add(WRITE_MAX_ROWS_PER_FILE);
+        options.add(WRITE_DATA_STORAGE_VERSION);
         options.add(INDEX_TYPE);
         options.add(INDEX_COLUMN);
         options.add(INDEX_NUM_PARTITIONS);
@@ -309,6 +317,9 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         builder.writeBatchSize(config.get(WRITE_BATCH_SIZE));
         builder.writeMode(LanceOptions.WriteMode.fromValue(config.get(WRITE_MODE)));
         builder.writeMaxRowsPerFile(config.get(WRITE_MAX_ROWS_PER_FILE));
+        if (config.getOptional(WRITE_DATA_STORAGE_VERSION).isPresent()) {
+            builder.writeDataStorageVersion(config.get(WRITE_DATA_STORAGE_VERSION));
+        }
 
         // Index configuration
         builder.indexType(LanceOptions.IndexType.fromValue(config.get(INDEX_TYPE)));

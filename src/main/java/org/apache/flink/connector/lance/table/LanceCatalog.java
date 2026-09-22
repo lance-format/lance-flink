@@ -19,6 +19,7 @@
 package org.apache.flink.connector.lance.table;
 
 import org.apache.flink.connector.lance.PrimaryKeyPersistence;
+import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.connector.lance.converter.LanceTypeConverter;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
@@ -591,8 +592,17 @@ public class LanceCatalog extends AbstractCatalog {
 
         // Materialize an empty dataset immediately (matching the community Spark/Trino behavior),
         // so the schema and primary-key metadata survive a catalog round-trip before any write.
+        // The format version is fixed when the dataset is created, so it has to be applied here
+        // and not only on the sink: a table materialized at the SDK default cannot later accept a
+        // MAP column, which needs 2.2+.
+        WriteParams.Builder createParams = new WriteParams.Builder();
+        String storageVersion = table.getOptions().get(
+                LanceOptions.WRITE_DATA_STORAGE_VERSION.key());
+        if (storageVersion != null && !storageVersion.trim().isEmpty()) {
+            createParams.withDataStorageVersion(storageVersion.trim());
+        }
         try (Dataset dataset = Dataset.create(
-                allocator, datasetPath, arrowSchema, new WriteParams.Builder().build())) {
+                allocator, datasetPath, arrowSchema, createParams.build())) {
             PrimaryKeyPersistence.persist(dataset, primaryKeys);
         } catch (Exception e) {
             throw new CatalogException("Failed to create table: " + tablePath, e);

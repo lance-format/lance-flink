@@ -215,6 +215,21 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
     }
 
     /**
+     * Write params for the create-if-absent path, carrying the configured Lance format version.
+     *
+     * <p>The version is fixed at creation, so it must be supplied here rather than on each write.
+     * Left unset when the option is absent, which lets the SDK keep its own default.
+     */
+    private WriteParams buildCreateParams() {
+        WriteParams.Builder builder = new WriteParams.Builder();
+        String version = options.getWriteDataStorageVersion();
+        if (version != null && !version.trim().isEmpty()) {
+            builder.withDataStorageVersion(version.trim());
+        }
+        return builder.build();
+    }
+
+    /**
      * Return an open {@link Dataset} handle, creating an empty dataset first if it does not yet
      * exist. This unifies first-write and steady-state paths so that both go through
      * {@code mergeInsert}/{@code delete}, eliminating the previous {@code Overwrite}-based
@@ -228,7 +243,7 @@ public class LanceUpsertSink extends RichSinkFunction<RowData> implements Checkp
                     openFailure.getMessage(), datasetPath);
             try {
                 return Dataset.create(
-                        allocator, datasetPath, arrowSchema, new WriteParams.Builder().build());
+                        allocator, datasetPath, arrowSchema, buildCreateParams());
             } catch (Exception createFailure) {
                 // A peer subtask likely won the create race; try open once more.
                 try {

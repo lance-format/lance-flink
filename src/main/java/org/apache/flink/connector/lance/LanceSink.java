@@ -166,9 +166,13 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
             }
 
             // Build write parameters
-            WriteParams writeParams = new WriteParams.Builder()
-                    .withMaxRowsPerFile(options.getWriteMaxRowsPerFile())
-                    .build();
+            WriteParams.Builder writeParamsBuilder = new WriteParams.Builder()
+                    .withMaxRowsPerFile(options.getWriteMaxRowsPerFile());
+            String storageVersion = options.getWriteDataStorageVersion();
+            if (storageVersion != null && !storageVersion.trim().isEmpty()) {
+                writeParamsBuilder.withDataStorageVersion(storageVersion.trim());
+            }
+            WriteParams writeParams = writeParamsBuilder.build();
             
             // Create Fragment
             List<FragmentMetadata> fragments = Fragment.write()
