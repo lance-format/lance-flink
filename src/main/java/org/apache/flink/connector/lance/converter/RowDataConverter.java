@@ -73,6 +73,7 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
@@ -572,10 +573,25 @@ public class RowDataConverter implements Serializable {
             ((DecimalVector) vector).setNull(index);
         } else if (vector instanceof FixedSizeListVector) {
             ((FixedSizeListVector) vector).setNull(index);
+        } else if (vector instanceof MapVector) {
+            // Must precede ListVector: MapVector extends ListVector, so the ListVector branch
+            // would otherwise swallow it and null the map as if it were a plain list.
+            ((MapVector) vector).setNull(index);
         } else if (vector instanceof ListVector) {
             ((ListVector) vector).setNull(index);
         } else if (vector instanceof StructVector) {
             ((StructVector) vector).setNull(index);
+        } else {
+            // Falling through silently is data corruption, not a harmless no-op. The validity
+            // bit of a slot that already holds a value stays set, so the previous row's value is
+            // emitted as this row's value with no error anywhere. A freshly allocated vector
+            // hides it -- the zeroed validity buffer reads back as null while getNullCount()
+            // still reports 0 -- which is why this went unnoticed. readValue, getFieldValue and
+            // writeValue all reject unknown types; this branch makes setNull consistent.
+            throw new LanceTypeConverter.UnsupportedTypeException(
+                    "Cannot write NULL: unsupported Arrow vector "
+                            + vector.getClass().getSimpleName()
+                            + " for field '" + vector.getField().getName() + "'");
         }
     }
 
