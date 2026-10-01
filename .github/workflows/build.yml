@@ -61,14 +61,16 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
 
-      - name: Build and run unit tests (lance-flink-${{ matrix.flink }})
+      - name: Build and run tests (lance-flink-${{ matrix.flink }})
         run: mvn -B -ntp -am -pl lance-flink-${{ matrix.flink }} verify
 
-      - name: Upload surefire reports on failure
+      - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: surefire-reports-flink${{ matrix.flink }}-jdk${{ matrix.java }}
-          path: '**/target/surefire-reports/**'
+          name: test-reports-flink${{ matrix.flink }}-jdk${{ matrix.java }}
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
           retention-days: 7
 

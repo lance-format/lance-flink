@@ -288,6 +288,47 @@
                     <version>3.1.2</version>
                 </plugin>
 
+                <!-- Maven Failsafe (runs the *ITCase integration tests).
+
+                     classesDirectory has to point at target/classes. At package time
+                     shade replaces the main artifact with a fat jar in which arrow is
+                     relocated, while the tests are compiled against the plain arrow
+                     signatures, so failsafe running against the main artifact would hit
+                     NoSuchMethodError. The shaded jar is checked separately by
+                     LanceShadedJarITCase. -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>3.1.2</version>
+                    <configuration>
+                        <includes>
+                            <!-- Failsafe's defaults, restated because listing any include
+                                 replaces the whole default set. *IT/IT* are here so a test
+                                 following the more common Maven naming does not go unnoticed. -->
+                            <include>**/*ITCase.java</include>
+                            <include>**/IT*.java</include>
+                            <include>**/*IT.java</include>
+                        </includes>
+                        <!-- Without this, a pattern that matches nothing exits 0 and a green
+                             build stops proving the integration tests ran at all. -->
+                        <failIfNoTests>true</failIfNoTests>
+                        <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                        <systemPropertyVariables>
+                            <lance.shaded.jar.dir>${project.build.directory}</lance.shaded.jar.dir>
+                            <lance.shaded.jar.name>${project.build.finalName}.jar</lance.shaded.jar.name>
+                        </systemPropertyVariables>
+                    </configuration>
+                    <executions>
+                        <execution>
+                            <id>integration-test</id>
+                            <goals>
+                                <goal>integration-test</goal>
+                                <goal>verify</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+
                 <!-- Build Helper Maven Plugin (用于添加额外源码目录) -->
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
