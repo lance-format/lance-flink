@@ -8,7 +8,7 @@ the `write.mode` option.
 | `write.mode` | Behaviour |
 |---|---|
 | `append` (default) | Append rows to the existing dataset |
-| `overwrite` | Replace the dataset on first write |
+| `overwrite` | Replace the dataset on the job's first write; rows from all parallel sink subtasks of the job are kept |
 
 ## Example
 
