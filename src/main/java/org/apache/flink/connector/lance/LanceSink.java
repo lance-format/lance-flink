@@ -36,6 +36,7 @@ import org.lance.WriteParams;
 import org.lance.CommitBuilder;
 import org.lance.Transaction;
 import org.lance.operation.Append;
+import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -51,6 +52,9 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * Lance Sink implementation.
@@ -74,6 +78,13 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(LanceSink.class);
 
+    /**
+     * Transaction property recording the Flink job that committed a version. In overwrite mode it
+     * lets a subtask tell rows written by a peer subtask of the same job (keep them) from the
+     * dataset that existed before the job started (replace it).
+     */
+    static final String JOB_ID_PROPERTY = "flink.job-id";
+
     private final LanceOptions options;
     private final RowType rowType;
 
@@ -85,6 +96,7 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
     private transient long totalWrittenRows;
     private transient boolean datasetExists;
     private transient boolean isFirstWrite;
+    private transient String jobId;
 
     /**
      * Create LanceSink
@@ -120,12 +132,12 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
         
         Path path = Paths.get(datasetPath);
         this.datasetExists = Files.exists(path);
-        
-        // If overwrite mode and dataset exists, delete first
-        if (datasetExists && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
-            LOG.info("Overwrite mode, deleting existing dataset: {}", datasetPath);
-            deleteDirectory(path);
-            this.datasetExists = false;
+
+        // Overwrite replaces the dataset once per job, not once per subtask: the existing dataset
+        // is replaced by the job's first commit (see flush()), so it must not be deleted here,
+        // where a parallel or restarted subtask would wipe rows a peer subtask already committed.
+        if (options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
+            this.jobId = getRuntimeContext().getJobId().toString();
         }
         
         LOG.info("Lance Sink opened, Schema: {}", rowType);
@@ -164,6 +176,12 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
                 datasetExists = true;
             }
 
+            // In overwrite mode only the job's first commit replaces the dataset; a subtask whose
+            // peer (or whose own pre-failover attempt) already committed for this job appends.
+            OptionalLong versionToReplace = datasetExists && isOverwritePending()
+                    ? versionToReplace(datasetPath)
+                    : OptionalLong.empty();
+
             // Build write parameters
             WriteParams writeParams = new WriteParams.Builder()
                     .withMaxRowsPerFile(options.getWriteMaxRowsPerFile())
@@ -179,35 +197,16 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
             
             if (!datasetExists) {
                 // Create new dataset (using Overwrite operation)
-                Overwrite operation = Overwrite.builder().fragments(fragments).schema(arrowSchema).build();
-                final CommitBuilder builder =
-                        new CommitBuilder(datasetPath, allocator).writeParams(Collections.emptyMap());
-                try (Transaction txn = new Transaction.Builder().operation(operation).build()) {
-                    dataset = builder.execute(txn);
-                }
-                datasetExists = true;
-                isFirstWrite = false;
+                commit(Overwrite.builder().fragments(fragments).schema(arrowSchema).build(), null);
                 LOG.info("Created new dataset: {}", datasetPath);
+            } else if (versionToReplace.isPresent()) {
+                replace(fragments, versionToReplace.getAsLong());
             } else {
-                // Append data
-                if (isFirstWrite && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
-                    // First write and overwrite mode
-                    Overwrite operation = Overwrite.builder().fragments(fragments).schema(arrowSchema).build();
-                    final CommitBuilder builder = new CommitBuilder(datasetPath, allocator);
-                    try (Transaction txn = new Transaction.Builder().operation(operation).build()) {
-                        dataset = builder.execute(txn);
-                    }
-                    isFirstWrite = false;
-                } else {
-                    // Append mode
-                    Append operation = Append.builder().fragments(fragments).build();
-                    final CommitBuilder builder = new CommitBuilder(datasetPath, allocator);
-                    try (Transaction txn = new Transaction.Builder().operation(operation).build()) {
-                        dataset = builder.execute(txn);
-                    }
-                }
+                commit(Append.builder().fragments(fragments).build(), null);
             }
-            
+            datasetExists = true;
+            isFirstWrite = false;
+
             totalWrittenRows += buffer.size();
             LOG.debug("Written {} rows, total: {} rows", buffer.size(), totalWrittenRows);
             
@@ -215,6 +214,63 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
         } catch (Exception e) {
             throw new IOException("Failed to write Lance dataset", e);
         }
+    }
+
+    private boolean isOverwritePending() {
+        return isFirstWrite && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE;
+    }
+
+    /**
+     * Replace the dataset version {@code readVersion} with {@code fragments}. If a peer subtask of
+     * this job replaced it concurrently, Lance rejects this commit as preempted, and the fragments
+     * are appended to the peer's result instead.
+     */
+    private void replace(List<FragmentMetadata> fragments, long readVersion) {
+        String datasetPath = options.getPath();
+        try {
+            commit(Overwrite.builder().fragments(fragments).schema(arrowSchema).build(), readVersion);
+            LOG.info("Overwrote existing dataset: {}", datasetPath);
+        } catch (RuntimeException e) {
+            if (versionToReplace(datasetPath).isPresent()) {
+                throw e;
+            }
+            LOG.info("Dataset {} was already overwritten by this job, appending instead", datasetPath);
+            if (!fragments.isEmpty()) {
+                commit(Append.builder().fragments(fragments).build(), null);
+            }
+        }
+    }
+
+    /**
+     * Commit an operation to the dataset. In overwrite mode the commit is tagged with this job's id.
+     */
+    private void commit(Operation operation, Long readVersion) {
+        Transaction.Builder txnBuilder = new Transaction.Builder().operation(operation);
+        if (readVersion != null) {
+            txnBuilder.readVersion(readVersion);
+        }
+        if (jobId != null) {
+            txnBuilder.transactionProperties(Collections.singletonMap(JOB_ID_PROPERTY, jobId));
+        }
+        final CommitBuilder builder =
+                new CommitBuilder(options.getPath(), allocator).writeParams(Collections.emptyMap());
+        try (Transaction txn = txnBuilder.build()) {
+            dataset = builder.execute(txn);
+        }
+    }
+
+    @Override
+    public void finish() throws Exception {
+        flush();
+        // A bounded overwrite job whose subtasks received no rows must still replace the existing
+        // dataset (with an empty one), unless a peer subtask has already done so for this job.
+        if (isOverwritePending() && Files.exists(Paths.get(options.getPath()))) {
+            OptionalLong versionToReplace = versionToReplace(options.getPath());
+            if (versionToReplace.isPresent()) {
+                replace(Collections.emptyList(), versionToReplace.getAsLong());
+            }
+        }
+        super.finish();
     }
 
     @Override
@@ -285,19 +341,30 @@ public class LanceSink extends RichSinkFunction<RowData> implements Checkpointed
     }
 
     /**
-     * Recursively delete directory
+     * The dataset version that this job's overwrite has to replace, or empty if the latest version
+     * was committed by this job, i.e. a peer subtask (or an earlier attempt of this one) has already
+     * replaced the dataset.
      */
-    private void deleteDirectory(Path path) throws IOException {
-        if (Files.isDirectory(path)) {
-            Files.list(path).forEach(child -> {
-                try {
-                    deleteDirectory(child);
-                } catch (IOException e) {
-                    LOG.warn("Failed to delete file: {}", child, e);
-                }
-            });
+    private OptionalLong versionToReplace(String datasetPath) {
+        Dataset latest;
+        try {
+            latest = Dataset.open(datasetPath, allocator);
+        } catch (IllegalArgumentException e) {
+            // The directory exists but holds no committed version yet (e.g. only data files).
+            return OptionalLong.of(0L);
         }
-        Files.deleteIfExists(path);
+        try (Dataset ds = latest) {
+            Optional<Transaction> txn = ds.readTransaction();
+            if (txn.isPresent()) {
+                try (Transaction t = txn.get()) {
+                    Map<String, String> properties = t.transactionProperties().orElse(null);
+                    if (properties != null && jobId.equals(properties.get(JOB_ID_PROPERTY))) {
+                        return OptionalLong.empty();
+                    }
+                }
+            }
+            return OptionalLong.of(ds.version());
+        }
     }
 
     /**
