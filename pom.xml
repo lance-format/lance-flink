@@ -286,6 +286,14 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>3.1.2</version>
+                    <configuration>
+                        <!-- Arrow's MemoryUtil reflects into java.nio.Buffer.address, which JDK 16+
+                             denies by default; without this any test that allocates off-heap Arrow
+                             memory dies with "Failed to initialize MemoryUtil". The @{argLine}
+                             placeholder is required to keep the JaCoCo agent, which populates the
+                             argLine property from jacoco:prepare-agent. -->
+                        <argLine>@{argLine} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    </configuration>
                 </plugin>
 
                 <!-- Build Helper Maven Plugin (用于添加额外源码目录) -->

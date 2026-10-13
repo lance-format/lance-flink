@@ -378,7 +378,12 @@ public class LanceDynamicTableSource implements ScanTableSource,
             return options.getReadFilter();
         }
 
-        String combinedFilter = String.join(" AND ", filters);
+        // Parenthesise each accepted filter before joining. The planner splits a conjunction into
+        // separate terms, and a term can itself contain a top-level OR; since AND binds tighter
+        // than OR, joining them bare regroups the predicate and silently returns wrong rows.
+        String combinedFilter = filters.stream()
+                .map(filter -> "(" + filter + ")")
+                .collect(Collectors.joining(" AND "));
         String originalFilter = options.getReadFilter();
 
         if (originalFilter != null && !originalFilter.isEmpty()) {
