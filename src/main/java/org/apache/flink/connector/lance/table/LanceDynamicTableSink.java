@@ -24,12 +24,10 @@ import org.apache.flink.connector.lance.PrimaryKeySelector;
 import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
-import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.ProviderContext;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
-import org.apache.flink.table.connector.sink.SinkFunctionProvider;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -41,7 +39,7 @@ import java.util.List;
 
 /**
  * Lance dynamic table sink.
- * 
+ *
  * <p>Implements DynamicTableSink interface, supports writing Flink data to Lance dataset.
  */
 public class LanceDynamicTableSink implements DynamicTableSink {
@@ -100,10 +98,19 @@ public class LanceDynamicTableSink implements DynamicTableSink {
         if (primaryKeys.isEmpty()) {
             // Append-only path: keep the existing LanceSink.
             LanceSink lanceSink = new LanceSink(options, rowType);
-            return SinkFunctionProvider.of(lanceSink);
+            // 版本桥接：Flink 1.x 走 SinkFunctionProvider.of（SinkFunction 已在 2.x 移除），
+            // Flink 2.x 走 SinkV2Provider.of。具体实现由各 flink 版本子模块下的
+            // LanceSinkProviderBridge 提供。
+            return LanceSinkProviderBridge.toProvider(lanceSink);
         }
 
         // Keyed upsert path: keyBy the primary key so all events for a key reach one subtask.
+        //
+        // TODO(flink-2.1): the upsert path still uses DataStreamSinkProvider +
+        // DataStream.addSink(SinkFunction), both removed in Flink 2.x. This path is
+        // excluded from the lance-flink-2.1 module compile (see lance-flink-2.1/pom.xml
+        // <excludes>). Follow-up: migrate LanceUpsertSink to Sink V2 +
+        // SupportsCommitter, then drop the exclusion.
         return new DataStreamSinkProvider() {
             @Override
             public DataStreamSink<?> consumeDataStream(

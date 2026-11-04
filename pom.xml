@@ -39,13 +39,12 @@
         <!-- Arrow 版本 (各版本模块可覆盖) -->
         <arrow.version>18.3.0</arrow.version>
 
-        <!-- Flink 多版本（注：Flink 1.17 因内置 Calcite 在 JDK 8 下存在已知 assertion/IAE bug，且
-             Flink 1.17 已于 2024-10 EOL，本工程不再支持，仅维护 1.18 / 1.19 / 1.20） -->
-        <flink118.version>1.18.1</flink118.version>
-        <flink119.version>1.19.1</flink119.version>
+        <!-- Flink 多版本（注：1.17 已于 2024-10 EOL；1.18/1.19 自 Flink 2.1 支持落地起不再维护，
+             仅维护最后一个 1.x 稳定版 1.20 与首个 2.x 适配版 2.1.1） -->
         <flink120.version>1.20.0</flink120.version>
+        <flink21.version>2.1.1</flink21.version>
         <!-- 默认 Flink 版本，子模块覆盖 -->
-        <flink.version>${flink118.version}</flink.version>
+        <flink.version>${flink120.version}</flink.version>
 
         <!-- 测试依赖版本 -->
         <junit.version>5.10.1</junit.version>
@@ -488,10 +487,13 @@
         </plugins>
     </build>
 
+    <!--
+      PR#1 的 Source V2 骨架 + PR#2 的 Sink V2（TwoPhaseCommittingSink）已完整，
+      lance-flink-2.1 模块正式加入构建矩阵。
+    -->
     <modules>
-        <module>lance-flink-1.18</module>
-        <module>lance-flink-1.19</module>
         <module>lance-flink-1.20</module>
+        <module>lance-flink-2.1</module>
     </modules>
 
     <repositories>
