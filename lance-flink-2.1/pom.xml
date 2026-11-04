@@ -316,9 +316,18 @@
                         <exclude>org/apache/flink/connector/lance/LanceAggregateSource.java</exclude>
                         <exclude>org/apache/flink/connector/lance/LanceSink.java</exclude>
                         <exclude>org/apache/flink/connector/lance/LanceUpsertSink.java</exclude>
+                        <exclude>org/apache/flink/connector/lance/table/LanceDynamicTableSink.java</exclude>
                         <exclude>org/apache/flink/connector/lance/table/LanceSourceStreamBridge.java</exclude>
                         <exclude>org/apache/flink/connector/lance/table/LanceSinkProviderBridge.java</exclude>
                     </excludes>
+                    <!-- 测试源码中直接依赖 LanceUpsertSink（Flink 1.x RichSinkFunction）的测试类
+                         也要从本模块的 test 编译中剔除；follow-up 迁移 upsert 到 Sink V2 后恢复。
+                         LanceSinkConcurrencyITCase 直接调用 1.x RichSinkFunction 的
+                         open/invoke/flush/close 生命周期方法，和 Sink V2 的 API 结构不兼容。 -->
+                    <testExcludes>
+                        <testExclude>org/apache/flink/connector/lance/LanceUpsertSinkITCase.java</testExclude>
+                        <testExclude>org/apache/flink/connector/lance/LanceSinkConcurrencyITCase.java</testExclude>
+                    </testExcludes>
                 </configuration>
             </plugin>
 

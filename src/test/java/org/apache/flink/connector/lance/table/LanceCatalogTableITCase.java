@@ -80,14 +80,15 @@ class LanceCatalogTableITCase {
         catalog.createDatabase("db", null, false);
         ObjectPath tablePath = new ObjectPath("db", "t");
 
-        catalog.createTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.createTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
         // The empty dataset must be materialized on disk right away, not on first write.
         assertThat(catalog.tableExists(tablePath)).isTrue();
@@ -100,15 +101,16 @@ class LanceCatalogTableITCase {
         catalog.createDatabase("db", null, false);
         ObjectPath tablePath = new ObjectPath("db", "t");
 
-        catalog.createTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.createTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
         // The primary key must survive a round-trip via the dataset config.
         CatalogTable loaded = (CatalogTable) catalog.getTable(tablePath);
@@ -123,14 +125,15 @@ class LanceCatalogTableITCase {
         catalog.createDatabase("db", null, false);
         ObjectPath tablePath = new ObjectPath("db", "t");
 
-        catalog.createTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.createTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
         CatalogTable loaded = (CatalogTable) catalog.getTable(tablePath);
         assertThat(loaded.getUnresolvedSchema().getPrimaryKey()).isEmpty();
@@ -142,23 +145,25 @@ class LanceCatalogTableITCase {
         catalog.createDatabase("db", null, false);
         ObjectPath tablePath = new ObjectPath("db", "t");
 
-        catalog.createTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.createTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
-        catalog.alterTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.alterTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("full_name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
         CatalogTable loaded = (CatalogTable) catalog.getTable(tablePath);
         List<String> columns = loaded.getUnresolvedSchema().getColumns().stream()
@@ -173,23 +178,25 @@ class LanceCatalogTableITCase {
         catalog.createDatabase("db", null, false);
         ObjectPath tablePath = new ObjectPath("db", "t");
 
-        catalog.createTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        catalog.createTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false);
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false);
 
-        assertThatThrownBy(() -> catalog.alterTable(tablePath, CatalogTable.of(
-                Schema.newBuilder()
+        assertThatThrownBy(() -> catalog.alterTable(tablePath, CatalogTable.newBuilder()
+                .schema(                Schema.newBuilder()
                         .column("id", DataTypes.BIGINT())
                         .column("name", DataTypes.STRING())
-                        .build(),
-                "",
-                Collections.emptyList(),
-                Collections.emptyMap()), false))
+                        .build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(Collections.emptyMap())
+                .build(), false))
                 .isInstanceOf(CatalogException.class)
                 .hasMessageContaining("data type change");
     }
