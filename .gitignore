@@ -65,12 +65,10 @@ test-data/
 
 ### Local planning & research (not for upstream PR) ###
 .research/
-task_plan.md
-findings.md
-progress.md
-
-### Local planning & research (not for upstream PR) ###
-.research/
+.gh-comments/
+.issue-*-body.md
+.pr*-review*.md
+.tmp-*.sql
 task_plan.md
 findings.md
 progress.md

@@ -96,7 +96,9 @@ public class LanceDynamicTableSink implements DynamicTableSink {
 
     @Override
     public String asSummaryString() {
-        return "Lance Table Sink (Flink 2.x, append-only)";
+        // 刻意与根 src 版本（Flink 1.x）保持一致："Lance Table Sink"。
+        // 若未来需要在 EXPLAIN 输出里区分版本，应在根 src 和 2.1 版同步修改。
+        return "Lance Table Sink";
     }
 
     public LanceOptions getOptions() {

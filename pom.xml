@@ -285,6 +285,27 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>3.1.2</version>
+                    <configuration>
+                        <!--
+                          Surefire 3.x 默认 includes 只匹配 **/Test*.java, **/*Test.java,
+                          **/*Tests.java, **/*TestCase.java 四个 pattern。本工程里关键的
+                          端到端集成测试全部按 *ITCase.java 命名（LanceConnectorITCase /
+                          LanceSqlITCase / LanceTimeTravelITCase / LanceUpsertSinkITCase /
+                          LanceSchemaEvolutionITCase / LanceSinkConcurrencyITCase /
+                          CompositePkDeleteITCase / LanceNamespaceCatalogITCase /
+                          LanceCatalogTableITCase），加上 FlinkSqlDemo 里也有真实
+                          @Test。显式扩展 includes 使它们能被 surefire 执行，否则 CI 全
+                          绿但 2PC 核心路径未被覆盖。
+                        -->
+                        <includes>
+                            <include>**/Test*.java</include>
+                            <include>**/*Test.java</include>
+                            <include>**/*Tests.java</include>
+                            <include>**/*TestCase.java</include>
+                            <include>**/*ITCase.java</include>
+                            <include>**/FlinkSqlDemo.java</include>
+                        </includes>
+                    </configuration>
                 </plugin>
 
                 <!-- Build Helper Maven Plugin (用于添加额外源码目录) -->
