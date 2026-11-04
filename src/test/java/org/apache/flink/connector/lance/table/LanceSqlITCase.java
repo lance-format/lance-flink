@@ -364,7 +364,7 @@ class LanceSqlITCase {
 
         LanceDynamicTableSource source = new LanceDynamicTableSource(withVersion, dataType);
         // Simulate the planner applying a projection push-down.
-        source.applyProjection(new int[][]{ new int[]{0} });
+source.applyProjection(new int[][]{ new int[]{0} }, null);
 
         RowType rowType = (RowType) dataType.getLogicalType();
         LanceOptions runtime = source.buildRuntimeOptions(rowType);
@@ -387,7 +387,7 @@ class LanceSqlITCase {
                 DataTypes.FIELD("name", DataTypes.STRING()));
 
         LanceDynamicTableSource source = new LanceDynamicTableSource(withTs, dataType);
-        source.applyProjection(new int[][]{ new int[]{1} });
+source.applyProjection(new int[][]{ new int[]{1} }, null);
 
         RowType rowType = (RowType) dataType.getLogicalType();
         LanceOptions runtime = source.buildRuntimeOptions(rowType);

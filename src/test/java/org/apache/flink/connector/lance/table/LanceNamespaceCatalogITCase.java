@@ -131,14 +131,15 @@ class LanceNamespaceCatalogITCase {
                 new org.apache.flink.table.catalog.ObjectPath("test_db", "my_table");
 
         catalog.createTable(tablePath,
-                org.apache.flink.table.catalog.CatalogTable.of(
-                        org.apache.flink.table.api.Schema.newBuilder()
+                org.apache.flink.table.catalog.CatalogTable.newBuilder()
+                        .schema(org.apache.flink.table.api.Schema.newBuilder()
                                 .column("id", org.apache.flink.table.api.DataTypes.INT())
                                 .column("name", org.apache.flink.table.api.DataTypes.STRING())
-                                .build(),
-                        "",
-                        java.util.Collections.emptyList(),
-                        tableOptions),
+                                .build())
+                        .comment("")
+                        .partitionKeys(java.util.Collections.emptyList())
+                        .options(tableOptions)
+                        .build(),
                 false);
 
         assertThat(catalog.tableExists(tablePath)).isTrue();

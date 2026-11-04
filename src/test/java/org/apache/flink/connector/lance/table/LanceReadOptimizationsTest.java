@@ -327,7 +327,9 @@ public class LanceReadOptimizationsTest {
 
             // Select only id column
             int[][] projection = {{0}};  // First column
-            source.applyProjection(projection);
+            // Flink 2.1 新签名 applyProjection(int[][], DataType) ——本连接器不使用
+            // producedDataType，测试场景下传 null 对行为无影响。以下全部 applyProjection 调用同此处理。
+            source.applyProjection(projection, null);
 
             // Verify projection is applied
             assertNotNull(source, "Projection should be successfully applied");
@@ -340,7 +342,7 @@ public class LanceReadOptimizationsTest {
 
             // Select id, name, score columns
             int[][] projection = {{0}, {1}, {3}};
-            source.applyProjection(projection);
+            source.applyProjection(projection, null);
 
             assertNotNull(source, "Multiple column projection should be successfully applied");
         }
@@ -359,7 +361,7 @@ public class LanceReadOptimizationsTest {
             LanceDynamicTableSource source = new LanceDynamicTableSource(baseOptions, physicalDataType);
 
             int[][] projection = {{0}, {2}};
-            source.applyProjection(projection);
+            source.applyProjection(projection, null);
 
             LanceDynamicTableSource copied = (LanceDynamicTableSource) source.copy();
 
@@ -395,7 +397,7 @@ public class LanceReadOptimizationsTest {
 
             // Apply projection
             int[][] projection = {{0}, {1}};
-            source.applyProjection(projection);
+            source.applyProjection(projection, null);
 
             // Apply limit
             source.applyLimit(50L);
@@ -410,7 +412,7 @@ public class LanceReadOptimizationsTest {
 
             // 1. Apply projection
             int[][] projection = {{0}, {1}, {3}};  // id, name, score
-            source.applyProjection(projection);
+            source.applyProjection(projection, null);
 
             // 2. Apply filter condition
             List<ResolvedExpression> filters = createComparisonFilter("score", 60.0, BuiltInFunctionDefinitions.GREATER_THAN_OR_EQUAL);

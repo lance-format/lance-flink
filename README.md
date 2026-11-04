@@ -17,9 +17,9 @@
   <a href="https://github.com/hashmapybx/flink-connector-lance/actions">
     <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status"/>
   </a>
-  <img src="https://img.shields.io/badge/flink-1.16.1-orange.svg" alt="Flink Version"/>
-  <img src="https://img.shields.io/badge/lance-0.23.3-purple.svg" alt="Lance Version"/>
-  <img src="https://img.shields.io/badge/java-8+-red.svg" alt="Java Version"/>
+  <img src="https://img.shields.io/badge/flink-1.20%20%7C%202.1-orange.svg" alt="Flink Version"/>
+  <img src="https://img.shields.io/badge/lance-7.0.0-purple.svg" alt="Lance Version"/>
+  <img src="https://img.shields.io/badge/java-11%20%7C%2017-red.svg" alt="Java Version"/>
 </p>
 
 <p align="center">
@@ -51,9 +51,17 @@
 
 ### Prerequisites
 
-- Java 8 or higher
-- Apache Flink 1.16.x
+| Flink Version | Required JDK | Build Module |
+|---------------|--------------|--------------|
+| **1.20.x**    | JDK 11 或 17 或 21 | `lance-flink-1.20` |
+| **2.1.x**     | JDK 17 或 21 | `lance-flink-2.1` |
+
 - Maven 3.6+
+- Lance 7.0.0 Java SDK
+
+> **注意**：Flink 2.x 对 Source/Sink API 进行了重大重构（FLIP-27 Source V2 + Sink V2 + `SupportsCommitter`）。
+> 本 connector 在 1.20 和 2.1 上共享大部分源码，仅对版本不兼容部分通过模块隔离
+> （`lance-flink-2.1/` 子模块）提供替代实现。
 
 ### Maven Dependency
 
@@ -90,7 +98,7 @@ SELECT * FROM vectors WHERE id > 0;
 ### DataStream API Example
 
 ```java
-// Read from Lance
+// Read from Lance (Flink 2.x：FLIP-27 Source V2)
 LanceSource source = LanceSource.builder()
     .path("/data/vectors")
     .batchSize(1024)
@@ -98,9 +106,13 @@ LanceSource source = LanceSource.builder()
     .rowType(rowType)
     .build();
 
-DataStream<RowData> stream = env.addSource(source);
+// Flink 2.x
+// DataStream<RowData> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "lance");
+// Flink 1.20 (legacy SourceFunction)
+// DataStream<RowData> stream = env.addSource(source);
+DataStream<RowData> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "lance");
 
-// Write to Lance
+// Write to Lance (Flink 2.x：TwoPhaseCommittingSink → Exactly-Once)
 LanceSink sink = LanceSink.builder()
     .path("/data/output")
     .batchSize(1024)
@@ -108,7 +120,11 @@ LanceSink sink = LanceSink.builder()
     .rowType(rowType)
     .build();
 
-stream.addSink(sink);
+// Flink 2.x
+// stream.sinkTo(sink);
+// Flink 1.20 (legacy SinkFunction)
+// stream.addSink(sink);
+stream.sinkTo(sink);
 ```
 
 ## 📚 Documentation
@@ -303,6 +319,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📋 Roadmap
 
+- [x] **Flink 2.1 支持**（FLIP-27 Source V2 + Sink V2 / `SupportsCommitter`，要求 JDK 17+，见 #85）
 - [ ] Streaming CDC support
 - [ ] Delta Lake interoperability
 - [ ] Distributed index building

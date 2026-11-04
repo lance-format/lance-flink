@@ -207,7 +207,7 @@ class LanceAggregatePushDownTest {
             LanceDynamicTableSource source = new LanceDynamicTableSource(options, physicalDataType);
             
             // Apply column pruning
-            source.applyProjection(new int[][]{{0}, {3}, {4}});  // id, amount, quantity
+source.applyProjection(new int[][]{{0}, {3}, {4}}, null);  // id, amount, quantity
             
             // Verify source still works correctly
             assertNotNull(source.getOptions());
