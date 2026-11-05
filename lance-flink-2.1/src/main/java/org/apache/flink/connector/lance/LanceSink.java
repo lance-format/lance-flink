@@ -58,6 +58,30 @@ import java.io.IOException;
  *
  * <p>构造函数与 Builder 签名与旧 1.x {@code RichSinkFunction} 版本保持一致，
  * 使上层共享源码（如 {@code LanceDynamicTableSink}）无需感知版本差异。
+ *
+ * <p><b>⚠️ 已知局限（R3）— OVERWRITE 与并行度 &gt; 1</b>：
+ * {@link LanceOptions.WriteMode#OVERWRITE} 下的"预清理"动作目前由
+ * {@link LanceSinkWriter} 的 subtask 0 在 {@code Fragment.write()} 之前
+ * 调用 {@code Dataset.drop(path)} 完成。这一调用必须发生在任何 subtask
+ * 的首次 {@code Fragment.write()} 之前，否则 fragments 清单会指向被
+ * drop 删掉的 {@code .lance} 文件。
+ *
+ * <p>Flink 保证了 **同一个 subtask** 内构造与 write 的顺序串行化（Mailbox），
+ * 但 **不同 subtask** 之间没有 barrier。真实集群启动时序偏斜的情况下，
+ * subtask-N (N &gt; 0) 可能在 subtask 0 的 drop 完成之前就开始 {@code Fragment.write()}；
+ * 此时它刚物化的 {@code .lance} 文件会被 subtask 0 的 drop 一并删掉，
+ * 导致当前 checkpoint 窗口的部分数据丢失（下一个 checkpoint 窗口已经干净，不受影响）。
+ *
+ * <p><b>缓解措施</b>（取其一）：
+ * <ul>
+ *   <li><b>推荐</b>：对 OVERWRITE 作业显式设置 {@code sink.parallelism = 1}，
+ *       Flink SQL 侧通过 {@code 'sink.parallelism' = '1'} 表选项、
+ *       DataStream 侧通过 {@code dataStream.sinkTo(sink).setParallelism(1)}；</li>
+ *   <li>或在作业编排侧"先跑一个 parallelism=1 的 OVERWRITE truncate 作业，
+ *       然后再启动真正的 parallelism=N 的 APPEND 作业"；</li>
+ *   <li>追踪：后续版本将把 OVERWRITE 预清理迁到 Committer 侧的 staging-path
+ *       commit-rename 模型，消除此竞态。</li>
+ * </ul>
  */
 public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommittable> {
 
