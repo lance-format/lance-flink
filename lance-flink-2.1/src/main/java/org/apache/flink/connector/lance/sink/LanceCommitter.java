@@ -36,23 +36,46 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Lance {@link Committer}：把 {@link LanceCommittable} 中累积的 Fragment 元数据
- * 以一次事务提交到 Lance dataset，保证 Exactly-Once。
+ * 以一次事务提交到 Lance dataset。
  *
- * <p>合并策略：Flink 一次 checkpoint 窗口内可能有多个 subtask 产生 committable，
- * runtime 以 {@code Collection<CommitRequest<CommT>>} 的形式一次性交给本 committer。
- * 我们按「相同 datasetPath 且非 createDataset」合并为一次 Append 事务，
- * 对 createDataset=true 的首次写入单独按 Overwrite 提交；这样在多并行度写同一张表时
- * 可显著减少 Lance 版本号的递增次数和并发冲突概率。
+ * <p>B1 修复后，Committer 承担 **提交决策** 但不承担 **目录物理清理**：
+ * <ul>
+ *   <li>目录物理清理（OVERWRITE 模式下的 drop）由 Writer 侧 subtask 0 在
+ *       {@code Fragment.write()} 之前完成——必须早于任何 fragment 落盘，否则
+ *       commit 时 fragments 清单会指向被 drop 删掉的 .lance 文件；
+ *   <li>Committer 的职责是基于 {@link Dataset#open(String)} 探测目标 dataset
+ *       当前是否存在 manifest：不存在 → {@link Overwrite} + schema 建表并提交全部
+ *       fragments；已存在 → 全部走 {@link Append}。
+ * </ul>
  *
- * <p>空 committable（没有 fragment）直接忽略——某个 subtask 本窗口没数据属于正常情况。
+ * <p>决策流程（按 datasetPath 独立判定）：
+ * <ol>
+ *   <li>遍历本批 CommitRequest，按 datasetPath 分桶聚合 fragments 与 schema；
+ *   <li>对每个 bucket：探测 dataset 是否已 "可 open"，首次 commit 走 Overwrite，
+ *       后续 commit 走 Append。</li>
+ * </ol>
+ *
+ * <p>合并提交：把一次 checkpoint 窗口内多个 subtask 的 fragments 聚合为**一次**
+ * Lance 事务（相同 datasetPath），显著降低版本号膨胀。失败时按 Flink Sink V2
+ * 的 {@link org.apache.flink.api.connector.sink2.Committer.CommitRequest} 契约向
+ * runtime 汇报（M2），而非从 {@link #commit} 直接抛 {@link IOException} 让整个作业挂掉。
  */
 public class LanceCommitter implements Committer<LanceCommittable> {
 
     private static final Logger LOG = LoggerFactory.getLogger(LanceCommitter.class);
+
+    /**
+     * 单条 CommitRequest 的最大重试次数，超过后转为 signalFailed。
+     * Lance 乐观并发写冲突若反复失败，极可能是上游数据或 schema 不兼容，无限 retry
+     * 只会让 Flink job 卡住。
+     */
+    private static final int MAX_RETRIES = 5;
 
     private final BufferAllocator allocator;
 
@@ -67,91 +90,103 @@ public class LanceCommitter implements Committer<LanceCommittable> {
             return;
         }
 
-        // 1) 提取非空 committables；按 (datasetPath, createDataset) 分组
-        //    为简单起见，同一次 commit 调用内一般只对应一张表，这里不做多表合并，
-        //    只做「create 单独一次 + append 合并一次」的两阶段提交。
-        String datasetPath = null;
-        Schema overwriteSchema = null;
-        List<FragmentMetadata> createFragments = new ArrayList<>();
-        List<FragmentMetadata> appendFragments = new ArrayList<>();
-
+        // 1) 按 datasetPath 分桶（支持极少见的"一次 commit 批次跨多表"情况）
+        Map<String, PathBucket> buckets = new LinkedHashMap<>();
         for (CommitRequest<LanceCommittable> req : requests) {
             LanceCommittable c = req.getCommittable();
             if (c.isEmpty()) {
                 continue;
             }
-            if (datasetPath == null) {
-                datasetPath = c.getDatasetPath();
-            } else if (!datasetPath.equals(c.getDatasetPath())) {
-                // 多张表的 committables 混在一起：理论上不应发生，除非上游 topology 把多个
-                // sink 合并到同一 committer operator。遇到就退化为「来者不拒、分别提交」。
-                LOG.warn(
-                        "Multiple dataset paths observed in a single commit batch: {} vs {}. "
-                                + "Will commit per-request instead of merging.",
-                        datasetPath,
-                        c.getDatasetPath());
-                commitSingle(c);
-                continue;
-            }
-            if (c.isCreateDataset()) {
-                createFragments.addAll(c.getFragments());
-                if (overwriteSchema == null) {
-                    overwriteSchema = c.getArrowSchema();
+            buckets.computeIfAbsent(c.getDatasetPath(), p -> new PathBucket(p, c))
+                    .add(req, c);
+        }
+
+        // 2) 按桶独立提交；某桶失败不影响其它桶
+        for (PathBucket bucket : buckets.values()) {
+            commitBucket(bucket);
+        }
+    }
+
+    /** 对单个 datasetPath 的所有 CommitRequest 聚合提交，并通过 CommitRequest API 回报结果。 */
+    private void commitBucket(PathBucket bucket) {
+        String path = bucket.datasetPath;
+        try {
+            boolean datasetExists = datasetExists(path);
+
+            if (!datasetExists) {
+                // 首次建表：Overwrite + schema + 全部 fragments
+                if (bucket.schema == null) {
+                    IOException err =
+                            new IOException(
+                                    "Cannot create Lance dataset at "
+                                            + path
+                                            + ": no Arrow schema in any committable in this batch");
+                    signalFail(bucket, err);
+                    return;
                 }
+                Operation op =
+                        Overwrite.builder()
+                                .fragments(bucket.allFragments())
+                                .schema(bucket.schema)
+                                .build();
+                executeTransaction(path, op);
+                LOG.info(
+                        "Lance commit: CREATE+OVERWRITE path={}, fragments={}",
+                        path,
+                        bucket.allFragments().size());
             } else {
-                appendFragments.addAll(c.getFragments());
+                // 已存在：全部 Append
+                Operation op = Append.builder().fragments(bucket.allFragments()).build();
+                executeTransaction(path, op);
+                LOG.info(
+                        "Lance commit: APPEND path={}, fragments={}",
+                        path,
+                        bucket.allFragments().size());
             }
-        }
-
-        if (datasetPath == null) {
-            // 全是空 committable
-            return;
-        }
-
-        // 2) 先处理 create（把所有被标记 createDataset 的 fragments 一次 Overwrite 掉）
-        if (!createFragments.isEmpty()) {
-            if (overwriteSchema == null) {
-                throw new IOException(
-                        "createDataset=true but no Arrow schema in committable for " + datasetPath);
-            }
-            executeOverwrite(datasetPath, overwriteSchema, createFragments);
-        }
-
-        // 3) 再处理 append
-        if (!appendFragments.isEmpty()) {
-            executeAppend(datasetPath, appendFragments);
+            // 整桶 commit 成功：所有 request 隐式成功，runtime 不再回放它们
+        } catch (Throwable t) {
+            // 乐观并发冲突 / Lance 侧的其它可恢复错误：让 runtime 下个 checkpoint 周期再试
+            LOG.warn("Lance commit failed on {}, deciding retry vs fail per request", path, t);
+            retryOrFail(bucket, t);
         }
     }
 
-    /** 单条 committable 走独立事务的退化分支。 */
-    private void commitSingle(LanceCommittable c) throws IOException {
-        if (c.isCreateDataset()) {
-            executeOverwrite(c.getDatasetPath(), c.getArrowSchema(), c.getFragments());
-        } else {
-            executeAppend(c.getDatasetPath(), c.getFragments());
+    /** 判定目标 dataset 是否已存在；不存在用 Lance 的异常来识别。 */
+    private boolean datasetExists(String path) {
+        try (Dataset ignored = Dataset.open(path, allocator)) {
+            return true;
+        } catch (Throwable t) {
+            // Lance Java API 在 "manifest 不存在" / "路径不存在" 等情况下均抛 RuntimeException；
+            // 这里统一视为"不存在"。真正的 IO 异常会在下一步的 commit 阶段再暴露并走重试路径。
+            LOG.debug("Dataset.open({}) failed, treating as non-existent: {}", path, t.toString());
+            return false;
         }
-    }
-
-    private void executeOverwrite(
-            String path, Schema schema, List<FragmentMetadata> fragments) throws IOException {
-        LOG.info("Lance commit: OVERWRITE path={}, fragments={}", path, fragments.size());
-        Operation op = Overwrite.builder().fragments(fragments).schema(schema).build();
-        executeTransaction(path, op);
-    }
-
-    private void executeAppend(String path, List<FragmentMetadata> fragments) throws IOException {
-        LOG.info("Lance commit: APPEND path={}, fragments={}", path, fragments.size());
-        Operation op = Append.builder().fragments(fragments).build();
-        executeTransaction(path, op);
     }
 
     private void executeTransaction(String path, Operation op) throws IOException {
         CommitBuilder builder = new CommitBuilder(path, allocator);
         try (Transaction txn = new Transaction.Builder().operation(op).build();
              Dataset ignored = builder.execute(txn)) {
-            // Dataset.execute 的返回值是本次提交后的新 Dataset 句柄；立刻关闭即可。
+            // Dataset.execute 的返回值是本次提交后的新 Dataset 句柄；立刻关闭即可
         } catch (Exception e) {
             throw new IOException("Lance commit failed on " + path, e);
+        }
+    }
+
+    /** 把 bucket 内所有 request 按重试次数阈值分流为 retryLater / signalFailed。 */
+    private void retryOrFail(PathBucket bucket, Throwable err) {
+        for (CommitRequest<LanceCommittable> req : bucket.requests) {
+            if (req.getNumberOfRetries() < MAX_RETRIES) {
+                req.retryLater();
+            } else {
+                req.signalFailedWithKnownReason(err);
+            }
+        }
+    }
+
+    private void signalFail(PathBucket bucket, Throwable err) {
+        for (CommitRequest<LanceCommittable> req : bucket.requests) {
+            req.signalFailedWithKnownReason(err);
         }
     }
 
@@ -163,6 +198,28 @@ public class LanceCommitter implements Committer<LanceCommittable> {
             } catch (Exception e) {
                 LOG.warn("Error closing BufferAllocator in LanceCommitter", e);
             }
+        }
+    }
+
+    /** 单条 datasetPath 的 commit 聚合桶。 */
+    private static final class PathBucket {
+        final String datasetPath;
+        final Schema schema; // 首个带 schema 的 committable 的 schema，用于潜在建表
+        final List<CommitRequest<LanceCommittable>> requests = new ArrayList<>();
+        final List<FragmentMetadata> fragments = new ArrayList<>();
+
+        PathBucket(String path, LanceCommittable first) {
+            this.datasetPath = path;
+            this.schema = first.getArrowSchema();
+        }
+
+        void add(CommitRequest<LanceCommittable> req, LanceCommittable c) {
+            requests.add(req);
+            fragments.addAll(c.getFragments());
+        }
+
+        List<FragmentMetadata> allFragments() {
+            return fragments;
         }
     }
 }

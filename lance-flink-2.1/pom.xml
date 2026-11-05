@@ -165,6 +165,16 @@
             <artifactId>flink-test-utils</artifactId>
         </dependency>
 
+        <!-- flink-core:tests 提供 MockSplitEnumeratorContext（org.apache.flink.api
+             .connector.source.mocks 包）用于 B2 新增的 SplitEnumerator 单元测试。 -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-core</artifactId>
+            <version>${flink.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-runtime</artifactId>
