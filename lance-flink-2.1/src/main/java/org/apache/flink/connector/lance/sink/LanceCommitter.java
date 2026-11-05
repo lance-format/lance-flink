@@ -61,10 +61,19 @@ import java.util.Map;
  *       后续 commit 走 Append。</li>
  * </ol>
  *
- * <p>合并提交：把一次 checkpoint 窗口内多个 subtask 的 fragments 聚合为**一次**
- * Lance 事务（相同 datasetPath），显著降低版本号膨胀。失败时按 Flink Sink V2
- * 的 {@link org.apache.flink.api.connector.sink2.Committer.CommitRequest} 契约向
- * runtime 汇报（M2），而非从 {@link #commit} 直接抛 {@link IOException} 让整个作业挂掉。
+ * <p>失败处理（R2 简化后的实际语义）：
+ * <ul>
+ *   <li>Lance 底层 commit 抛出任何异常 → 按 {@link #MAX_RETRIES} 阈值分流：
+ *       <code>req.getNumberOfRetries() &lt; MAX_RETRIES</code> → {@link CommitRequest#retryLater()}；
+ *       否则 {@link CommitRequest#signalFailedWithKnownReason(Throwable)}。</li>
+ *   <li>bucket 的 schema 缺失（需建表却没有任何 committable 携带 schema）
+ *       → 直接 {@link CommitRequest#signalFailedWithKnownReason(Throwable)}，不重试
+ *       （这是作业配置错误，重试也解决不了）。</li>
+ * </ul>
+ *
+ * <p>本实现存意不区分 known / unknown reason：走 object_store 的 Lance JNI 既会把
+ * 底层 S3 / HDFS / local-FS 的异常包装成 {@link RuntimeException}，也会把乐观并发冲突包
+ * 装成同类型，在 Java 端无法稳定区分；统一走 known reason 签名更安全。
  */
 public class LanceCommitter implements Committer<LanceCommittable> {
 
@@ -74,7 +83,13 @@ public class LanceCommitter implements Committer<LanceCommittable> {
      * 单条 CommitRequest 的最大重试次数，超过后转为 signalFailed。
      * Lance 乐观并发写冲突若反复失败，极可能是上游数据或 schema 不兼容，无限 retry
      * 只会让 Flink job 卡住。
+     *
+     * <p>protected 是为了在单元测试里调小这个值、暴露边界行为。
      */
+    protected int maxRetries() {
+        return MAX_RETRIES;
+    }
+
     private static final int MAX_RETRIES = 5;
 
     private final BufferAllocator allocator;
@@ -151,8 +166,12 @@ public class LanceCommitter implements Committer<LanceCommittable> {
         }
     }
 
-    /** 判定目标 dataset 是否已存在；不存在用 Lance 的异常来识别。 */
-    private boolean datasetExists(String path) {
+    /**
+     * 判定目标 dataset 是否已存在；不存在用 Lance 的异常来识别。
+     *
+     * <p>protected 是为了让单元测试可以注入停饱行为（R2 测试点）。
+     */
+    protected boolean datasetExists(String path) {
         try (Dataset ignored = Dataset.open(path, allocator)) {
             return true;
         } catch (Throwable t) {
@@ -163,7 +182,13 @@ public class LanceCommitter implements Committer<LanceCommittable> {
         }
     }
 
-    private void executeTransaction(String path, Operation op) throws IOException {
+    /**
+     * 执行一次 Lance 事务。
+     *
+     * <p>protected 是为了让单元测试可以注入模拟失败（R2 测试点）——而实际
+     * 冲突很难在不起 Lance JNI handle 的情况下造出来。
+     */
+    protected void executeTransaction(String path, Operation op) throws IOException {
         CommitBuilder builder = new CommitBuilder(path, allocator);
         try (Transaction txn = new Transaction.Builder().operation(op).build();
              Dataset ignored = builder.execute(txn)) {
@@ -173,10 +198,14 @@ public class LanceCommitter implements Committer<LanceCommittable> {
         }
     }
 
-    /** 把 bucket 内所有 request 按重试次数阈值分流为 retryLater / signalFailed。 */
+    /**
+     * 把 bucket 内所有 request 按重试次数阈值分流为 retryLater / signalFailed。
+     * 并非依赖异常类型——因为走 object_store 的 Lance JNI 会把连接失败 /
+     * 权限失败 / 乐观并发冲突均包装成 {@link RuntimeException}，在 Java 端难以区分。
+     */
     private void retryOrFail(PathBucket bucket, Throwable err) {
         for (CommitRequest<LanceCommittable> req : bucket.requests) {
-            if (req.getNumberOfRetries() < MAX_RETRIES) {
+            if (req.getNumberOfRetries() < maxRetries()) {
                 req.retryLater();
             } else {
                 req.signalFailedWithKnownReason(err);
