@@ -321,11 +321,12 @@ public class LanceNamespaceCatalog extends AbstractCatalog {
             tableOptions.putAll(props);
         }
 
-        return CatalogTable.of(
-                org.apache.flink.table.api.Schema.newBuilder().build(),
-                "",
-                Collections.emptyList(),
-                tableOptions);
+        return CatalogTable.newBuilder()
+                .schema(org.apache.flink.table.api.Schema.newBuilder().build())
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(tableOptions)
+                .build();
     }
 
     @Override

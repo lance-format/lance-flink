@@ -196,7 +196,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSource createDynamicTableSource(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateOptionsSkippingHadoopPrefixes(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -211,7 +211,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public DynamicTableSink createDynamicTableSink(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         Map<String, String> tableOptions = context.getCatalogTable().getOptions();
-        helper.validateExcept(extractHadoopOptionKeys(tableOptions));
+        validateOptionsSkippingHadoopPrefixes(helper, tableOptions);
 
         ReadableConfig config = helper.getOptions();
         LanceOptions options = buildLanceOptions(config, tableOptions);
@@ -259,13 +259,32 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     /**
      * 提取以 {@code hadoop.} 为前缀的选项 key，供 {@code validateExcept} 跳过校验。
      */
-    private String[] extractHadoopOptionKeys(Map<String, String> tableOptions) {
+    private static String[] extractHadoopOptionKeys(Map<String, String> tableOptions) {
         if (tableOptions == null) {
             return new String[0];
         }
         return tableOptions.keySet().stream()
                 .filter(key -> key != null && key.startsWith("hadoop."))
                 .toArray(String[]::new);
+    }
+
+    /**
+     * {@link FactoryUtil.FactoryHelper#validateExcept(String...)} 在 Flink 2.1 收紧了
+     * 入参校验：{@code Preconditions.checkArgument(prefixesToSkip.length > 0,
+     * "Prefixes to skip can not be empty.")}。当 WITH 子句里没有任何 {@code hadoop.}
+     * 前缀选项时，{@link #extractHadoopOptionKeys(Map)} 返回空数组，直接把它传给
+     * {@code validateExcept} 会在 Flink 2.1 下抛 {@code IllegalArgumentException}。
+     * 这里做一层保护：有前缀才走 {@code validateExcept(prefixes)}，否则退回 {@code validate()}。
+     * 对 Flink 1.20 完全兼容，因为 1.x 不介意空 varargs。
+     */
+    private static void validateOptionsSkippingHadoopPrefixes(
+            FactoryUtil.TableFactoryHelper helper, Map<String, String> tableOptions) {
+        String[] prefixes = extractHadoopOptionKeys(tableOptions);
+        if (prefixes.length == 0) {
+            helper.validate();
+        } else {
+            helper.validateExcept(prefixes);
+        }
     }
 
     /**

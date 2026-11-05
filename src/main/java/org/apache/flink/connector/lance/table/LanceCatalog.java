@@ -460,12 +460,12 @@ public class LanceCatalog extends AbstractCatalog {
                     options.putAll(getStorageOptionsForTable());
                 }
                 
-                return CatalogTable.of(
-                        schemaBuilder.build(),
-                        "Lance Table: " + tablePath.getFullName(),
-                        Collections.emptyList(),
-                        options
-                );
+                return CatalogTable.newBuilder()
+                        .schema(schemaBuilder.build())
+                        .comment("Lance Table: " + tablePath.getFullName())
+                        .partitionKeys(Collections.emptyList())
+                        .options(options)
+                        .build();
             } finally {
                 dataset.close();
             }

@@ -18,18 +18,15 @@
 
 package org.apache.flink.connector.lance.table;
 
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.connector.lance.LanceInputFormat;
 import org.apache.flink.connector.lance.LanceSource;
 import org.apache.flink.connector.lance.aggregate.AggregateInfo;
 import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.ProviderContext;
 import org.apache.flink.table.connector.source.DataStreamScanProvider;
 import org.apache.flink.table.connector.source.DynamicTableSource;
-import org.apache.flink.table.connector.source.InputFormatProvider;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.connector.source.abilities.SupportsAggregatePushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
@@ -112,12 +109,17 @@ public class LanceDynamicTableSource implements ScanTableSource,
         LanceOptions finalOptions = buildRuntimeOptions(rowType);
         final RowType finalRowType = projectedRowType;
 
-        // Use DataStreamScanProvider
+        // Use DataStreamScanProvider. 实现 Flink 2.x 的新签名 produceDataStream(ProviderContext, env)，
+        // Flink 1.20 仍保留旧签名作为 default 方法，因此本实现同时兼容 1.20 和 2.1。
         return new DataStreamScanProvider() {
             @Override
-            public DataStream<RowData> produceDataStream(StreamExecutionEnvironment execEnv) {
+            public DataStream<RowData> produceDataStream(
+                    ProviderContext providerContext, StreamExecutionEnvironment execEnv) {
                 LanceSource source = new LanceSource(finalOptions, finalRowType);
-                return execEnv.addSource(source, "LanceSource");
+                // 版本桥接：Flink 1.x 走 env.addSource(SourceFunction, name)，
+                // Flink 2.x 走 env.fromSource(Source, WatermarkStrategy.noWatermarks(), name)。
+                // 具体实现由各 flink 版本子模块下的 LanceSourceStreamBridge 提供。
+                return LanceSourceStreamBridge.toStream(execEnv, source, "LanceSource");
             }
 
             @Override
@@ -190,8 +192,9 @@ public class LanceDynamicTableSource implements ScanTableSource,
     }
 
     @Override
-    public void applyProjection(int[][] projectedFields) {
-        // Only support top-level field projection
+    public void applyProjection(int[][] projectedFields, DataType producedDataType) {
+        // Only support top-level field projection；producedDataType 由 planner 传入，
+        // 表示投影之后的输出 schema，本连接器后续按 projectedFields 自行推导，故不直接使用。
         this.projectedFields = Arrays.stream(projectedFields)
                 .mapToInt(arr -> arr[0])
                 .toArray();

@@ -1,0 +1,373 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.connector.lance;
+
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.api.connector.source.ReaderOutput;
+import org.apache.flink.api.connector.source.Source;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
+import org.apache.flink.connector.lance.aggregate.AggregateExecutor;
+import org.apache.flink.connector.lance.aggregate.AggregateInfo;
+import org.apache.flink.connector.lance.config.LanceOptions;
+import org.apache.flink.connector.lance.converter.LanceTypeConverter;
+import org.apache.flink.connector.lance.converter.RowDataConverter;
+import org.apache.flink.connector.lance.source.LanceEnumState;
+import org.apache.flink.connector.lance.source.LanceEnumStateSerializer;
+import org.apache.flink.connector.lance.source.LanceSplit;
+import org.apache.flink.connector.lance.source.LanceSplitSerializer;
+import org.apache.flink.connector.lance.util.LanceOpener;
+import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.logical.RowType;
+
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.lance.Dataset;
+import org.lance.Fragment;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Lance 聚合下推数据源（Flink 2.x 版本）。
+ *
+ * <p>保留与旧实现一致的语义：全量扫描 → 累加 → 一次性输出聚合结果。
+ * 聚合是全局的，不能并行累加（AggregateExecutor 非线程安全且结果需合并），因此
+ * 发行一个 {@link LanceSplit.Kind#WHOLE_DATASET} split 并仅由并行度 0 的 reader 处理，
+ * 其余 reader 收到 noMoreSplits 直接结束——与旧 {@code subtaskIndex != 0 跳过} 等价。
+ */
+public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEnumState> {
+
+    private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(LanceAggregateSource.class);
+
+    private final LanceOptions options;
+    private final RowType sourceRowType;
+    private final AggregateInfo aggregateInfo;
+
+    public LanceAggregateSource(
+            LanceOptions options, RowType sourceRowType, AggregateInfo aggregateInfo) {
+        this.options = options;
+        this.sourceRowType = sourceRowType;
+        this.aggregateInfo = aggregateInfo;
+    }
+
+    @Override
+    public Boundedness getBoundedness() {
+        return Boundedness.BOUNDED;
+    }
+
+    @Override
+    public SourceReader<RowData, LanceSplit> createReader(SourceReaderContext readerContext) {
+        return new AggregateReader(readerContext, options, sourceRowType, aggregateInfo);
+    }
+
+    @Override
+    public SplitEnumerator<LanceSplit, LanceEnumState> createEnumerator(
+            SplitEnumeratorContext<LanceSplit> enumContext) {
+        return new SingleWholeDatasetEnumerator(enumContext, null);
+    }
+
+    @Override
+    public SplitEnumerator<LanceSplit, LanceEnumState> restoreEnumerator(
+            SplitEnumeratorContext<LanceSplit> enumContext, LanceEnumState checkpoint) {
+        return new SingleWholeDatasetEnumerator(enumContext, checkpoint.getRemainingSplits());
+    }
+
+    @Override
+    public SimpleVersionedSerializer<LanceSplit> getSplitSerializer() {
+        return LanceSplitSerializer.INSTANCE;
+    }
+
+    @Override
+    public SimpleVersionedSerializer<LanceEnumState> getEnumeratorCheckpointSerializer() {
+        return LanceEnumStateSerializer.INSTANCE;
+    }
+
+    public AggregateInfo getAggregateInfo() {
+        return aggregateInfo;
+    }
+
+    public LanceOptions getOptions() {
+        return options;
+    }
+
+    public RowType getSourceRowType() {
+        return sourceRowType;
+    }
+
+    public RowType getResultRowType() {
+        // 和旧实现保持一致：在 reader 实际初始化前，静态构造一个 executor 推导结果 RowType
+        RowType srt = sourceRowType;
+        if (srt == null) {
+            // 需要 dataset 才能推导，调用方应预先指定 sourceRowType
+            return null;
+        }
+        AggregateExecutor exec = new AggregateExecutor(aggregateInfo, srt);
+        return exec.buildResultRowType();
+    }
+
+    // ========================================================================
+    // Enumerator：仅派发一个 WHOLE_DATASET split 给 reader 0，其余 reader 立即
+    // 收到 noMoreSplits。
+    // ========================================================================
+    private static class SingleWholeDatasetEnumerator
+            implements SplitEnumerator<LanceSplit, LanceEnumState> {
+
+        private final SplitEnumeratorContext<LanceSplit> context;
+        private boolean dispatched;
+
+        SingleWholeDatasetEnumerator(
+                SplitEnumeratorContext<LanceSplit> context,
+                @Nullable Collection<LanceSplit> restored) {
+            this.context = context;
+            this.dispatched = restored != null && restored.isEmpty();
+        }
+
+        @Override
+        public void start() {}
+
+        @Override
+        public void handleSplitRequest(int subtaskId, @Nullable String requesterHostname) {
+            if (!context.registeredReaders().containsKey(subtaskId)) {
+                return;
+            }
+            if (subtaskId == 0 && !dispatched) {
+                context.assignSplit(LanceSplit.wholeDataset(), subtaskId);
+                dispatched = true;
+            } else {
+                context.signalNoMoreSplits(subtaskId);
+            }
+        }
+
+        @Override
+        public void addSplitsBack(List<LanceSplit> splits, int subtaskId) {
+            if (!splits.isEmpty()) {
+                dispatched = false;
+            }
+        }
+
+        @Override
+        public void addReader(int subtaskId) {}
+
+        @Override
+        public LanceEnumState snapshotState(long checkpointId) {
+            return new LanceEnumState(
+                    dispatched ? Collections.emptyList() : Collections.singletonList(LanceSplit.wholeDataset()));
+        }
+
+        @Override
+        public void close() {}
+    }
+
+    // ========================================================================
+    // Reader：拿到 split 后全量扫描 + 累加，EOF 时输出聚合结果。
+    // ========================================================================
+    private static class AggregateReader implements SourceReader<RowData, LanceSplit> {
+
+        private final SourceReaderContext context;
+        private final LanceOptions options;
+        private final RowType sourceRowType;
+        private final AggregateInfo aggregateInfo;
+        private final String[] selectedColumns;
+        private final Deque<LanceSplit> pending = new ArrayDeque<>();
+
+        private BufferAllocator allocator;
+        private Dataset dataset;
+        private RowDataConverter converter;
+        private AggregateExecutor executor;
+
+        private boolean noMoreSplits;
+        private boolean aggregateDone;
+        private Iterator<RowData> resultIter = Collections.emptyIterator();
+
+        AggregateReader(
+                SourceReaderContext context,
+                LanceOptions options,
+                RowType sourceRowType,
+                AggregateInfo aggregateInfo) {
+            this.context = context;
+            this.options = options;
+            this.sourceRowType = sourceRowType;
+            this.aggregateInfo = aggregateInfo;
+
+            List<String> requiredColumns = aggregateInfo.getRequiredColumns();
+            this.selectedColumns =
+                    requiredColumns.isEmpty() ? null : requiredColumns.toArray(new String[0]);
+        }
+
+        @Override
+        public void start() {
+            context.sendSplitRequest();
+        }
+
+        @Override
+        public InputStatus pollNext(ReaderOutput<RowData> output) throws Exception {
+            if (resultIter.hasNext()) {
+                output.collect(resultIter.next());
+                return resultIter.hasNext() ? InputStatus.MORE_AVAILABLE : InputStatus.END_OF_INPUT;
+            }
+            if (aggregateDone) {
+                return InputStatus.END_OF_INPUT;
+            }
+            LanceSplit split = pending.pollFirst();
+            if (split != null) {
+                runAggregate();
+                aggregateDone = true;
+                resultIter = executor.getResults().iterator();
+                return resultIter.hasNext() ? InputStatus.MORE_AVAILABLE : InputStatus.END_OF_INPUT;
+            }
+            if (noMoreSplits) {
+                // reader 0 以外的 reader 走这里：没分到 split，直接 EOF
+                return InputStatus.END_OF_INPUT;
+            }
+            return InputStatus.NOTHING_AVAILABLE;
+        }
+
+        private void runAggregate() throws Exception {
+            ensureDatasetOpen();
+
+            String filter = options.getReadFilter();
+            boolean hasFilter = filter != null && !filter.isEmpty();
+
+            if (hasFilter) {
+                scanDatasetAndAccumulate(filter);
+            } else {
+                for (Fragment f : dataset.getFragments()) {
+                    scanFragmentAndAccumulate(f);
+                }
+            }
+            LOG.info("LanceAggregateSource: aggregation completed, result rows={}",
+                    executor.getResults().size());
+        }
+
+        private void scanDatasetAndAccumulate(String filter) throws Exception {
+            ScanOptions.Builder sb = new ScanOptions.Builder();
+            sb.batchSize(options.getReadBatchSize());
+            if (selectedColumns != null && selectedColumns.length > 0) {
+                sb.columns(Arrays.asList(selectedColumns));
+            }
+            sb.filter(filter);
+            try (LanceScanner scanner = dataset.newScan(sb.build());
+                 ArrowReader reader = scanner.scanBatches()) {
+                drain(reader);
+            }
+        }
+
+        private void scanFragmentAndAccumulate(Fragment fragment) throws Exception {
+            ScanOptions.Builder sb = new ScanOptions.Builder();
+            sb.batchSize(options.getReadBatchSize());
+            if (selectedColumns != null && selectedColumns.length > 0) {
+                sb.columns(Arrays.asList(selectedColumns));
+            }
+            try (LanceScanner scanner = fragment.newScan(sb.build());
+                 ArrowReader reader = scanner.scanBatches()) {
+                drain(reader);
+            }
+        }
+
+        private void drain(ArrowReader reader) throws Exception {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                for (RowData row : converter.toRowDataList(root)) {
+                    executor.accumulate(row);
+                }
+            }
+        }
+
+        private void ensureDatasetOpen() {
+            if (dataset != null) return;
+            this.allocator = new RootAllocator(Long.MAX_VALUE);
+            this.dataset = LanceOpener.open(options.getPath(), allocator, options);
+            RowType rt = sourceRowType;
+            if (rt == null) {
+                Schema sc = dataset.getSchema();
+                rt = LanceTypeConverter.toFlinkRowType(sc);
+            }
+            this.converter = new RowDataConverter(rt);
+            this.executor = new AggregateExecutor(aggregateInfo, rt);
+            this.executor.init();
+        }
+
+        @Override
+        public List<LanceSplit> snapshotState(long checkpointId) {
+            // 聚合是全局的；运行到一半 failover 直接把当前 split 放回让其重跑
+            List<LanceSplit> state = new ArrayList<>(pending);
+            if (!aggregateDone && !pending.isEmpty()) {
+                return state;
+            }
+            return state;
+        }
+
+        @Override
+        public CompletableFuture<Void> isAvailable() {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public void addSplits(List<LanceSplit> splits) {
+            pending.addAll(splits);
+        }
+
+        @Override
+        public void notifyNoMoreSplits() {
+            noMoreSplits = true;
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (executor != null) {
+                executor.reset();
+                executor = null;
+            }
+            if (dataset != null) {
+                try { dataset.close(); } catch (Exception e) {
+                    LOG.warn("Error closing Lance dataset", e);
+                }
+                dataset = null;
+            }
+            if (allocator != null) {
+                try { allocator.close(); } catch (Exception e) {
+                    LOG.warn("Error closing BufferAllocator", e);
+                }
+                allocator = null;
+            }
+        }
+    }
+}

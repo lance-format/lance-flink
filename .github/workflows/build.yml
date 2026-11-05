@@ -41,14 +41,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flink: ["1.18", "1.19", "1.20"]
-        java: ["11", "17"]
+        # 仓库当前维护两个版本矩阵：
+        #   - 1.20（最后一个 1.x LTS，JDK 11/17/21）
+        #   - 2.1（首个适配版本，JDK 17/21；Flink 2.x 要求 JDK 17+）
+        # 1.18 / 1.19 已随 Flink 2.1 支持落地下线（见 issue #85）。
         include:
-          # Flink 1.19+ supports JDK 21; 1.18 only supports 8/11/17, so it is
-          # intentionally not paired with 21.
-          - flink: "1.19"
-            java: "21"
           - flink: "1.20"
+            java: "11"
+          - flink: "1.20"
+            java: "17"
+          - flink: "1.20"
+            java: "21"
+          - flink: "2.1"
+            java: "17"
+          - flink: "2.1"
             java: "21"
     steps:
       - name: Checkout

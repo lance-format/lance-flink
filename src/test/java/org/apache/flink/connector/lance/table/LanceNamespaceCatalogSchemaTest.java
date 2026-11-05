@@ -220,7 +220,12 @@ class LanceNamespaceCatalogSchemaTest {
         Map<String, String> options = new HashMap<>();
         options.put("connector", "lance");
         options.put("path", "/tmp/does-not-need-to-exist");
-        return CatalogTable.of(schema, "", Collections.emptyList(), options);
+        return CatalogTable.newBuilder()
+                .schema(schema)
+                .comment("")
+                .partitionKeys(Collections.emptyList())
+                .options(options)
+                .build();
     }
 
     /**
