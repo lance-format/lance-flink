@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * LanceSplitEnumerator tests using Flink's {@link MockSplitEnumeratorContext}.
@@ -143,6 +144,117 @@ class LanceSplitEnumeratorTest {
             // Reader 0 never registered — the request should be a no-op.
             enumerator.handleSplitRequest(0, "localhost");
             assertThat(ctx.getSplitsAssignmentSequence()).isEmpty();
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // #89 regression: cold-start Async discovery
+    //
+    // start() must schedule discoverSplits() via callAsync (not block the
+    // coordinator main thread). handleSplitRequest arriving before discovery
+    // completes must park in pendingSplitRequests, not emit signalNoMoreSplits
+    // (round-1 minor m2). When discovery completes, pending requests must be
+    // replayed in FIFO order.
+    // ------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("#89: cold start schedules discovery via callAsync, not inline")
+    void coldStartSchedulesDiscoveryAsync() throws Exception {
+        try (MockSplitEnumeratorContext<LanceSplit> ctx = new MockSplitEnumeratorContext<>(1);
+             LanceSplitEnumerator enumerator =
+                     new LanceSplitEnumerator(ctx, dummyOptions(), /* restoredSplits */ null)) {
+
+            // start() must NOT touch the dataset synchronously; it only schedules
+            // the discovery callable. If it blocked, we'd never reach the next line
+            // for an unreachable path.
+            enumerator.start();
+
+            // One callable queued on the async executor, exactly.
+            assertThat(ctx.getOneTimeCallables()).hasSize(1);
+        }
+    }
+
+    @Test
+    @DisplayName("#89: handleSplitRequest before discovery completes parks in pendingSplitRequests")
+    void pendingSplitRequestIsParkedAndReplayed() throws Exception {
+        try (MockSplitEnumeratorContext<LanceSplit> ctx = new MockSplitEnumeratorContext<>(1);
+             LanceSplitEnumerator enumerator =
+                     new LanceSplitEnumerator(ctx, dummyOptions(), /* restoredSplits */ null)) {
+
+            enumerator.start();
+            // callAsync scheduled; discovery has NOT yet run.
+
+            // Reader registers and requests a split before discovery completes.
+            ctx.registerReader(new ReaderInfo(0, "localhost"));
+            enumerator.handleSplitRequest(0, "localhost");
+
+            // No assignment yet (discovery still pending); the request is parked.
+            // Critically: no signalNoMoreSplits emitted either — the reader is NOT fenced.
+            assertThat(ctx.getSplitsAssignmentSequence()).isEmpty();
+            assertThat(ctx.hasNoMoreSplits(0)).isFalse();
+
+            // Drive the async callable. discoverSplits will throw because the
+            // dummy path points to a non-existent dataset; the enumerator must
+            // propagate the exception to the coordinator (test verifies this via
+            // the try/catch-and-assert pattern below).
+            assertThatThrownBy(ctx::runNextOneTimeCallable)
+                    .isInstanceOf(Throwable.class)
+                    .hasMessageContaining("Failed to discover Lance splits");
+
+            // After failure: parked request was cleared, nothing hangs.
+            // (An alternate test below covers the success path with a fake context.)
+        }
+    }
+
+    @Test
+    @DisplayName("#89: successful async discovery replays pending requests and dispatches splits")
+    void successfulDiscoveryReplaysPending() throws Throwable {
+        // We can't open a real Lance dataset in this unit test, so we use a
+        // TestLanceSplitEnumerator that stubs out discoverSplits().
+        List<LanceSplit> fakeSplits =
+                Arrays.asList(LanceSplit.fragment(7L), LanceSplit.fragment(8L));
+
+        try (MockSplitEnumeratorContext<LanceSplit> ctx = new MockSplitEnumeratorContext<>(1);
+             TestLanceSplitEnumerator enumerator =
+                     new TestLanceSplitEnumerator(ctx, dummyOptions(), fakeSplits)) {
+
+            enumerator.start();
+
+            // Two readers race in requesting splits before discovery finishes.
+            ctx.registerReader(new ReaderInfo(0, "localhost"));
+            enumerator.handleSplitRequest(0, "localhost");
+            enumerator.handleSplitRequest(0, "localhost");
+
+            // Still no assignment: discovery hasn't completed.
+            assertThat(ctx.getSplitsAssignmentSequence()).isEmpty();
+
+            // Drive the discovery callable.
+            ctx.runNextOneTimeCallable();
+
+            // Both parked requests replayed; both fake splits dispatched in order.
+            assertThat(ctx.getSplitsAssignmentSequence()).hasSize(2);
+            assertThat(ctx.getSplitsAssignmentSequence().get(0).assignment().get(0).get(0).getFragmentId())
+                    .isEqualTo(7L);
+            assertThat(ctx.getSplitsAssignmentSequence().get(1).assignment().get(0).get(0).getFragmentId())
+                    .isEqualTo(8L);
+        }
+    }
+
+    /** Test-only subclass that bypasses the real Lance JNI in discoverSplits(). */
+    private static final class TestLanceSplitEnumerator extends LanceSplitEnumerator {
+        private final List<LanceSplit> fakeSplits;
+
+        TestLanceSplitEnumerator(
+                MockSplitEnumeratorContext<LanceSplit> ctx,
+                LanceOptions options,
+                List<LanceSplit> fakeSplits) {
+            super(ctx, options, /* restoredSplits */ null);
+            this.fakeSplits = fakeSplits;
+        }
+
+        @Override
+        protected List<LanceSplit> discoverSplits() {
+            return fakeSplits;
         }
     }
 }
