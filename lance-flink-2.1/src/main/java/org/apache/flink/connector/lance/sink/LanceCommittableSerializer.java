@@ -48,6 +48,12 @@ import java.util.List;
  * <p>相比 version=1 的变化：删除了 {@code createDataset:bool}（Writer 侧的决策，B1 修复后由
  * Committer 承担），新增 {@code writeMode:byte} 让 Committer 知道作业声明的写入语义。
  *
+ * <p><b>向后兼容（R1）</b>：{@link #deserialize(int, byte[])} 保留 version=1 的读路径，
+ * 把老格式的 {@code createDataset:bool} 映射为 {@link LanceOptions.WriteMode#OVERWRITE}
+ * （true）或 {@link LanceOptions.WriteMode#APPEND}（false）——这是 B1 修复前的隐含语义：
+ * createDataset=true 的 committable 走 Overwrite 建表、其它走 Append。这样升级到 2.1 新版本
+ * 的作业可以**无缝读取**早期 alpha 构建里持久化在 checkpoint 中的 v1 committable。
+ *
  * <p>Arrow Schema 没有 {@code implements Serializable}，但提供了 {@code toJson()} 与
  * {@code Schema.fromJSON(String)} 的往返接口；使用 JSON 文本既简单又稳定。
  *
@@ -59,6 +65,9 @@ public final class LanceCommittableSerializer
     public static final LanceCommittableSerializer INSTANCE = new LanceCommittableSerializer();
 
     private static final int VERSION = 2;
+
+    /** 仍支持读取的历史版本号（写入端只用 {@link #VERSION}）。 */
+    private static final int VERSION_V1 = 1;
 
     private static final byte WRITE_MODE_APPEND = 0;
     private static final byte WRITE_MODE_OVERWRITE = 1;
@@ -93,16 +102,26 @@ public final class LanceCommittableSerializer
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     public LanceCommittable deserialize(int version, byte[] serialized) throws IOException {
-        if (version != VERSION) {
-            throw new IOException(
-                    "Unsupported LanceCommittable serializer version: "
-                            + version
-                            + " (expected "
-                            + VERSION
-                            + ")");
+        switch (version) {
+            case VERSION:
+                return deserializeV2(serialized);
+            case VERSION_V1:
+                return deserializeV1(serialized);
+            default:
+                throw new IOException(
+                        "Unsupported LanceCommittable serializer version: "
+                                + version
+                                + " (supported: "
+                                + VERSION_V1
+                                + ", "
+                                + VERSION
+                                + ")");
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private LanceCommittable deserializeV2(byte[] serialized) throws IOException {
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(serialized))) {
             String path = in.readUTF();
             LanceOptions.WriteMode writeMode = decodeWriteMode(in.readByte());
@@ -127,6 +146,50 @@ public final class LanceCommittableSerializer
             return new LanceCommittable(path, schema, writeMode, fragments);
         } catch (ClassNotFoundException e) {
             throw new IOException("Failed to deserialize FragmentMetadata list", e);
+        }
+    }
+
+    /**
+     * 读取 version=1 的历史格式（B1 修复前写入的 committable）：
+     * <pre>
+     *   [datasetPath:utf]
+     *   [createDataset:bool]                              // v1 特有
+     *   [schemaJsonLen:int][schemaJson:bytes]
+     *   [fragmentCount:int][fragmentBlobLen:int][fragmentBlob:bytes]
+     * </pre>
+     * 映射规则：{@code createDataset=true → WriteMode.OVERWRITE}；否则 APPEND。
+     * 这符合 v1 的隐含语义：createDataset=true 的 committable 由 Committer 走 Overwrite 建表。
+     */
+    @SuppressWarnings("unchecked")
+    private LanceCommittable deserializeV1(byte[] serialized) throws IOException {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(serialized))) {
+            String path = in.readUTF();
+            boolean createDataset = in.readBoolean();
+            LanceOptions.WriteMode writeMode =
+                    createDataset
+                            ? LanceOptions.WriteMode.OVERWRITE
+                            : LanceOptions.WriteMode.APPEND;
+
+            int schemaLen = in.readInt();
+            Schema schema = null;
+            if (schemaLen > 0) {
+                byte[] schemaJson = new byte[schemaLen];
+                in.readFully(schemaJson);
+                schema =
+                        Schema.fromJSON(
+                                new String(schemaJson, java.nio.charset.StandardCharsets.UTF_8));
+            }
+
+            int count = in.readInt();
+            int blobLen = in.readInt();
+            byte[] blob = new byte[blobLen];
+            in.readFully(blob);
+            List<FragmentMetadata> fragments =
+                    count == 0 ? new ArrayList<>() : (List<FragmentMetadata>) javaDeserialize(blob);
+
+            return new LanceCommittable(path, schema, writeMode, fragments);
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Failed to deserialize FragmentMetadata list (v1)", e);
         }
     }
 

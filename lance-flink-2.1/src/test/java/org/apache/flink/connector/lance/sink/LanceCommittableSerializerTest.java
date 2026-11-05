@@ -27,7 +27,11 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 
@@ -140,5 +144,89 @@ class LanceCommittableSerializerTest {
     @DisplayName("getVersion is stable positive")
     void getVersionReturnsPositive() {
         assertThat(serializer.getVersion()).isGreaterThan(0);
+    }
+
+    // ------------------------------------------------------------------------
+    // R1 regression: v1 backward-compatibility
+    //
+    // Pre-B1-fix committables had the format:
+    //   [datasetPath:utf][createDataset:bool]
+    //   [schemaJsonLen:int][schemaJson:bytes]
+    //   [fragmentCount:int][fragmentBlobLen:int][fragmentBlob:bytes]
+    //
+    // After B1, the Writer no longer emits createDataset; we store writeMode
+    // instead. The serializer must still read old v1 bytes from in-flight
+    // checkpoints taken against an alpha 2.1 build, mapping createDataset=true
+    // to OVERWRITE (the implicit v1 semantics: "this committable creates the
+    // dataset" == "run Overwrite") and false to APPEND.
+    // ------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("v1 committable with createDataset=true deserializes to OVERWRITE")
+    void v1CreateDatasetTrueMapsToOverwrite() throws IOException {
+        byte[] v1Bytes = encodeV1("/tmp/legacy", /* createDataset */ true, /* schema */ null);
+
+        LanceCommittable out = serializer.deserialize(1, v1Bytes);
+
+        assertThat(out.getDatasetPath()).isEqualTo("/tmp/legacy");
+        assertThat(out.getWriteMode()).isEqualTo(LanceOptions.WriteMode.OVERWRITE);
+        assertThat(out.getArrowSchema()).isNull();
+        assertThat(out.getFragments()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("v1 committable with createDataset=false deserializes to APPEND and preserves schema")
+    void v1CreateDatasetFalseMapsToAppendWithSchema() throws IOException {
+        Schema schema =
+                new Schema(
+                        Collections.singletonList(
+                                new Field(
+                                        "x",
+                                        FieldType.nullable(new ArrowType.Int(64, true)),
+                                        null)));
+
+        byte[] v1Bytes = encodeV1("hdfs://ns/legacy", /* createDataset */ false, schema);
+
+        LanceCommittable out = serializer.deserialize(1, v1Bytes);
+
+        assertThat(out.getDatasetPath()).isEqualTo("hdfs://ns/legacy");
+        assertThat(out.getWriteMode()).isEqualTo(LanceOptions.WriteMode.APPEND);
+        assertThat(out.getArrowSchema()).isNotNull();
+        assertThat(out.getArrowSchema().getFields()).hasSize(1);
+        assertThat(out.getArrowSchema().getFields().get(0).getName()).isEqualTo("x");
+    }
+
+    /**
+     * Hand-rolled v1 byte layout (matches the pre-B1 LanceCommittableSerializer).
+     * Keeping this as a test-only helper so the production serializer never
+     * writes v1 again (write path only emits v2 via {@code getVersion()}).
+     */
+    private static byte[] encodeV1(String path, boolean createDataset, Schema schema)
+            throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(256);
+        try (DataOutputStream out = new DataOutputStream(bos)) {
+            out.writeUTF(path);
+            out.writeBoolean(createDataset);
+
+            byte[] schemaJson =
+                    schema == null
+                            ? new byte[0]
+                            : schema.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.writeInt(schemaJson.length);
+            out.write(schemaJson);
+
+            // zero fragments + zero-length blob (consistent with real v1 for empty list)
+            out.writeInt(0);
+            byte[] emptyListBlob;
+            try (ByteArrayOutputStream bbos = new ByteArrayOutputStream(64);
+                 ObjectOutputStream oos = new ObjectOutputStream(bbos)) {
+                oos.writeObject(new ArrayList<>());
+                oos.flush();
+                emptyListBlob = bbos.toByteArray();
+            }
+            out.writeInt(emptyListBlob.length);
+            out.write(emptyListBlob);
+        }
+        return bos.toByteArray();
     }
 }
