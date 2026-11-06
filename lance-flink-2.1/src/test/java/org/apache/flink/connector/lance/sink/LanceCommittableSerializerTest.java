@@ -24,6 +24,12 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.lance.FragmentMetadata;
+import org.lance.fragment.DataFile;
+import org.lance.fragment.DeletionFile;
+import org.lance.fragment.DeletionFileType;
+import org.lance.fragment.RowIdMeta;
+import org.lance.fragment.VersionMeta;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -34,6 +40,7 @@ import java.io.ObjectOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -44,10 +51,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>B2 (maintainer review PR#86): committable serialization is on the Flink 2PC
  * checkpoint path; a format regression silently breaks Exactly-Once on recovery.
  *
- * <p>These tests avoid constructing real {@code FragmentMetadata} (which requires a
- * live Lance dataset JNI handle) and focus on the metadata we control: schema,
- * writeMode, path, and the empty-fragments boundary. End-to-end committable paths
- * with non-empty fragments are already covered by {@code FlinkSqlDemo}.
+ * <p>#88 (M5): the fragment segment moved from Java native serialization to explicit
+ * field encoding ({@link FragmentMetadataCodec}). These tests now construct real
+ * {@code FragmentMetadata} (its nested types all expose public constructors, so no
+ * live Lance JNI handle is needed) and verify lossless round-trip plus v1/v2 read
+ * compatibility.
  */
 class LanceCommittableSerializerTest {
 
@@ -226,6 +234,205 @@ class LanceCommittableSerializerTest {
             }
             out.writeInt(emptyListBlob.length);
             out.write(emptyListBlob);
+        }
+        return bos.toByteArray();
+    }
+
+    // ------------------------------------------------------------------------
+    // #88 regression: non-empty FragmentMetadata round-trip + v2 compat
+    // ------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Non-empty FragmentMetadata round-trips losslessly via explicit encoding")
+    void nonEmptyFragmentsRoundTrip() throws IOException {
+        DataFile dataFile =
+                new DataFile(
+                        "file:///tmp/data/0.lance",
+                        new int[] {0, 1},
+                        new int[] {0, 1},
+                        /* fileMajorVersion */ 1,
+                        /* fileMinorVersion */ 0,
+                        /* fileSizeBytes */ 1024L,
+                        /* baseId */ null);
+
+        DeletionFile deletionFile =
+                new DeletionFile(
+                        /* id */ 7L,
+                        /* readVersion */ 3L,
+                        /* numDeletedRows */ 10L,
+                        DeletionFileType.ARRAY,
+                        /* baseId */ null);
+
+        RowIdMeta rowIdMeta = RowIdMeta.fromRowIds(new long[] {1L, 2L, 3L});
+        VersionMeta createdAt = new VersionMeta("created-at-metadata");
+        VersionMeta lastUpdated = new VersionMeta("last-updated-metadata");
+
+        FragmentMetadata fragment =
+                new FragmentMetadata(
+                        /* id */ 1,
+                        Collections.singletonList(dataFile),
+                        /* physicalRows */ 100L,
+                        deletionFile,
+                        rowIdMeta,
+                        createdAt,
+                        lastUpdated);
+
+        LanceCommittable in =
+                new LanceCommittable(
+                        "/tmp/x",
+                        /* schema */ null,
+                        LanceOptions.WriteMode.APPEND,
+                        Collections.singletonList(fragment));
+
+        byte[] bytes = serializer.serialize(in);
+        LanceCommittable out = serializer.deserialize(serializer.getVersion(), bytes);
+
+        List<FragmentMetadata> outFragments = out.getFragments();
+        assertThat(outFragments).hasSize(1);
+
+        FragmentMetadata ofm = outFragments.get(0);
+        assertThat(ofm.getId()).isEqualTo(1);
+        assertThat(ofm.getPhysicalRows()).isEqualTo(100L);
+
+        assertThat(ofm.getFiles()).hasSize(1);
+        DataFile odf = ofm.getFiles().get(0);
+        assertThat(odf.getPath()).isEqualTo("file:///tmp/data/0.lance");
+        assertThat(odf.getFields()).containsExactly(0, 1);
+        assertThat(odf.getColumnIndices()).containsExactly(0, 1);
+        assertThat(odf.getFileMajorVersion()).isEqualTo(1);
+        assertThat(odf.getFileMinorVersion()).isEqualTo(0);
+        assertThat(odf.getFileSizeBytes()).isEqualTo(1024L);
+        assertThat(odf.getBaseId()).isEmpty();
+
+        DeletionFile odel = ofm.getDeletionFile();
+        assertThat(odel).isNotNull();
+        assertThat(odel.getId()).isEqualTo(7L);
+        assertThat(odel.getReadVersion()).isEqualTo(3L);
+        assertThat(odel.getNumDeletedRows()).isEqualTo(10L);
+        assertThat(odel.getFileType()).isEqualTo(DeletionFileType.ARRAY);
+        assertThat(odel.getBaseId()).isEmpty();
+
+        // RowIdMeta / VersionMeta: assert round-trip equality on getMetadata(),
+        // without assuming Lance's internal encoding of the metadata string.
+        assertThat(ofm.getRowIdMeta()).isNotNull();
+        assertThat(ofm.getRowIdMeta().getMetadata()).isEqualTo(rowIdMeta.getMetadata());
+        assertThat(ofm.getCreatedAtVersionMeta().getMetadata()).isEqualTo(createdAt.getMetadata());
+        assertThat(ofm.getLastUpdatedAtVersionMeta().getMetadata())
+                .isEqualTo(lastUpdated.getMetadata());
+    }
+
+    @Test
+    @DisplayName("Nullable fragment fields round-trip: no deletion file / row-id / version meta, present baseId")
+    void nullableFragmentFieldsRoundTrip() throws IOException {
+        DataFile dataFile =
+                new DataFile(
+                        "s3://bucket/data/1.lance",
+                        new int[] {0, 2},
+                        new int[] {1, 3},
+                        /* fileMajorVersion */ 2,
+                        /* fileMinorVersion */ 1,
+                        /* fileSizeBytes */ null,
+                        /* baseId */ 5);
+
+        FragmentMetadata fragment =
+                new FragmentMetadata(
+                        /* id */ 2,
+                        Collections.singletonList(dataFile),
+                        /* physicalRows */ 200L,
+                        /* deletionFile */ null,
+                        /* rowIdMeta */ null);
+
+        LanceCommittable in =
+                new LanceCommittable(
+                        "/tmp/y",
+                        /* schema */ null,
+                        LanceOptions.WriteMode.APPEND,
+                        Collections.singletonList(fragment));
+
+        byte[] bytes = serializer.serialize(in);
+        LanceCommittable out = serializer.deserialize(serializer.getVersion(), bytes);
+
+        FragmentMetadata ofm = out.getFragments().get(0);
+        assertThat(ofm.getDeletionFile()).isNull();
+        assertThat(ofm.getRowIdMeta()).isNull();
+
+        DataFile odf = ofm.getFiles().get(0);
+        assertThat(odf.getFileSizeBytes()).isNull();
+        assertThat(odf.getBaseId()).contains(5);
+        assertThat(odf.getFields()).containsExactly(0, 2);
+        assertThat(odf.getColumnIndices()).containsExactly(1, 3);
+    }
+
+    @Test
+    @DisplayName("v2 committable with Java-serialized fragments still deserializes")
+    void v2JavaSerializedFragmentsStillDeserialize() throws IOException {
+        DataFile dataFile =
+                new DataFile(
+                        "file:///tmp/legacy/0.lance",
+                        new int[] {0},
+                        new int[] {0},
+                        /* fileMajorVersion */ 1,
+                        /* fileMinorVersion */ 0,
+                        /* fileSizeBytes */ 42L,
+                        /* baseId */ null);
+
+        FragmentMetadata fragment =
+                new FragmentMetadata(
+                        /* id */ 9,
+                        Collections.singletonList(dataFile),
+                        /* physicalRows */ 9L,
+                        /* deletionFile */ null,
+                        /* rowIdMeta */ null);
+
+        byte[] v2Bytes =
+                encodeV2(
+                        "/tmp/legacy",
+                        LanceOptions.WriteMode.APPEND,
+                        /* schema */ null,
+                        Collections.singletonList(fragment));
+
+        LanceCommittable out = serializer.deserialize(2, v2Bytes);
+
+        assertThat(out.getDatasetPath()).isEqualTo("/tmp/legacy");
+        assertThat(out.getFragments()).hasSize(1);
+        assertThat(out.getFragments().get(0).getId()).isEqualTo(9);
+        assertThat(out.getFragments().get(0).getFiles().get(0).getPath())
+                .isEqualTo("file:///tmp/legacy/0.lance");
+    }
+
+    /**
+     * Hand-rolled v2 byte layout (matches the pre-#88 LanceCommittableSerializer,
+     * whose fragment segment used Java native serialization). Test-only helper; the
+     * production serializer never writes v2 again (write path only emits v3).
+     */
+    private static byte[] encodeV2(
+            String path,
+            LanceOptions.WriteMode mode,
+            Schema schema,
+            List<FragmentMetadata> fragments)
+            throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(256);
+        try (DataOutputStream out = new DataOutputStream(bos)) {
+            out.writeUTF(path);
+            out.writeByte(mode == LanceOptions.WriteMode.OVERWRITE ? 1 : 0);
+
+            byte[] schemaJson =
+                    schema == null
+                            ? new byte[0]
+                            : schema.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            out.writeInt(schemaJson.length);
+            out.write(schemaJson);
+
+            out.writeInt(fragments.size());
+            byte[] blob;
+            try (ByteArrayOutputStream bbos = new ByteArrayOutputStream(256);
+                 ObjectOutputStream oos = new ObjectOutputStream(bbos)) {
+                oos.writeObject(new ArrayList<>(fragments));
+                oos.flush();
+                blob = bbos.toByteArray();
+            }
+            out.writeInt(blob.length);
+            out.write(blob);
         }
         return bos.toByteArray();
     }
