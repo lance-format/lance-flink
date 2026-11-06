@@ -245,6 +245,13 @@
                 </executions>
             </plugin>
 
+            <!-- failsafe is declared on the jar modules only: the root aggregator has
+                 no test classes of its own, and failIfNoTests=true would fail it. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+            </plugin>
+
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
