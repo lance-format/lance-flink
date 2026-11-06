@@ -114,12 +114,38 @@ public class LanceOptions implements Serializable {
 
     /**
      * Write batch size
+     *
+     * <p>注意（#87）：此参数控制的是 <b>flush 粒度</b>，而非磁盘物化粒度。Writer 不再在
+     * {@code write()} 内因 batch-size 满而物化 {@code .lance} 文件；物化统一延迟到
+     * {@code flush()} / {@code prepareCommit()}。仅当内存缓冲超过
+     * {@link #WRITE_MEMORY_CAP_BYTES} 时才会提前物化（安全阀，见该选项）。
      */
     public static final ConfigOption<Integer> WRITE_BATCH_SIZE = ConfigOptions
             .key("write.batch-size")
             .intType()
             .defaultValue(1024)
-            .withDescription("Batch size for writing, default 1024");
+            .withDescription(
+                    "Controls flush granularity, not disk materialization granularity. "
+                            + "Rows are buffered in memory and materialized on flush()/prepareCommit(); "
+                            + "this value sizes the initial row buffer. Default 1024.");
+
+    /**
+     * Write memory cap in bytes
+     *
+     * <p>防止 {@code write()} 阶段内存缓冲无限增长（#87）：当估算的缓冲字节数超过该上限时，
+     * writer 会提前物化以释放内存（这会重新打开一个窄的 orphan-file 窗口）。默认 -1 表示无上限，
+     * 此时 {@code write()} 阶段永不物化、彻底消除 orphan 窗口，但内存压力随 checkpoint interval
+     * 增长——长 checkpoint interval 的作业建议显式设置一个上限。
+     */
+    public static final ConfigOption<Long> WRITE_MEMORY_CAP_BYTES = ConfigOptions
+            .key("write.memory-cap-bytes")
+            .longType()
+            .defaultValue(-1L)
+            .withDescription(
+                    "Maximum estimated in-memory buffer size (bytes) for rows buffered between "
+                            + "materializations. -1 means unbounded (write() never materializes, "
+                            + "eliminating orphan files but growing memory with checkpoint interval). "
+                            + "When exceeded, the writer materializes early to avoid OOM. Default -1.");
 
     /**
      * Write mode: append or overwrite
@@ -381,6 +407,7 @@ public class LanceOptions implements Serializable {
     private final int writeBatchSize;
     private final WriteMode writeMode;
     private final int writeMaxRowsPerFile;
+    private final long writeMemoryCapBytes;
     private final IndexType indexType;
     private final String indexColumn;
     private final int indexNumPartitions;
@@ -409,6 +436,7 @@ public class LanceOptions implements Serializable {
         this.writeBatchSize = builder.writeBatchSize;
         this.writeMode = builder.writeMode;
         this.writeMaxRowsPerFile = builder.writeMaxRowsPerFile;
+        this.writeMemoryCapBytes = builder.writeMemoryCapBytes;
         this.indexType = builder.indexType;
         this.indexColumn = builder.indexColumn;
         this.indexNumPartitions = builder.indexNumPartitions;
@@ -469,6 +497,10 @@ public class LanceOptions implements Serializable {
 
     public int getWriteMaxRowsPerFile() {
         return writeMaxRowsPerFile;
+    }
+
+    public long getWriteMemoryCapBytes() {
+        return writeMemoryCapBytes;
     }
 
     public IndexType getIndexType() {
@@ -583,6 +615,7 @@ public class LanceOptions implements Serializable {
         builder.writeBatchSize(config.get(WRITE_BATCH_SIZE));
         builder.writeMode(WriteMode.fromValue(config.get(WRITE_MODE)));
         builder.writeMaxRowsPerFile(config.get(WRITE_MAX_ROWS_PER_FILE));
+        builder.writeMemoryCapBytes(config.get(WRITE_MEMORY_CAP_BYTES));
 
         // Index configuration
         builder.indexType(IndexType.fromValue(config.get(INDEX_TYPE)));
@@ -632,6 +665,7 @@ public class LanceOptions implements Serializable {
         private int writeBatchSize = 1024;
         private WriteMode writeMode = WriteMode.APPEND;
         private int writeMaxRowsPerFile = 1000000;
+        private long writeMemoryCapBytes = -1L;
         private IndexType indexType = IndexType.IVF_PQ;
         private String indexColumn;
         private int indexNumPartitions = 256;
@@ -696,6 +730,11 @@ public class LanceOptions implements Serializable {
 
         public Builder writeMaxRowsPerFile(int writeMaxRowsPerFile) {
             this.writeMaxRowsPerFile = writeMaxRowsPerFile;
+            return this;
+        }
+
+        public Builder writeMemoryCapBytes(long writeMemoryCapBytes) {
+            this.writeMemoryCapBytes = writeMemoryCapBytes;
             return this;
         }
 
@@ -811,6 +850,11 @@ public class LanceOptions implements Serializable {
                 throw new IllegalArgumentException("write.max-rows-per-file must be greater than 0, current value: " + writeMaxRowsPerFile);
             }
 
+            // Validate write memory cap (-1 = unbounded, >= 0 = bounded)
+            if (writeMemoryCapBytes < -1) {
+                throw new IllegalArgumentException("write.memory-cap-bytes must be -1 (unbounded) or >= 0, current value: " + writeMemoryCapBytes);
+            }
+
             // Validate index partition count
             if (indexNumPartitions <= 0) {
                 throw new IllegalArgumentException("index.num-partitions must be greater than 0, current value: " + indexNumPartitions);
@@ -863,6 +907,7 @@ public class LanceOptions implements Serializable {
                 Objects.equals(readLimit, that.readLimit) &&
                 writeBatchSize == that.writeBatchSize &&
                 writeMaxRowsPerFile == that.writeMaxRowsPerFile &&
+                writeMemoryCapBytes == that.writeMemoryCapBytes &&
                 indexNumPartitions == that.indexNumPartitions &&
                 indexNumBits == that.indexNumBits &&
                 indexMaxLevel == that.indexMaxLevel &&
@@ -889,7 +934,7 @@ public class LanceOptions implements Serializable {
     @Override
     public int hashCode() {
         return Objects.hash(path, readBatchSize, readLimit, readColumns, readFilter, writeBatchSize, writeMode,
-                writeMaxRowsPerFile, indexType, indexColumn, indexNumPartitions, indexNumSubVectors,
+                writeMaxRowsPerFile, writeMemoryCapBytes, indexType, indexColumn, indexNumPartitions, indexNumSubVectors,
                 indexNumBits, indexMaxLevel, indexM, indexEfConstruction, vectorColumn, vectorMetric,
                 vectorNprobes, vectorEf, vectorRefineFactor, defaultDatabase, warehouse,
                 readVersion, readAsOfTimestamp);
@@ -908,6 +953,7 @@ public class LanceOptions implements Serializable {
                 ", writeBatchSize=" + writeBatchSize +
                 ", writeMode=" + writeMode +
                 ", writeMaxRowsPerFile=" + writeMaxRowsPerFile +
+                ", writeMemoryCapBytes=" + writeMemoryCapBytes +
                 ", indexType=" + indexType +
                 ", indexColumn='" + indexColumn + '\'' +
                 ", indexNumPartitions=" + indexNumPartitions +
