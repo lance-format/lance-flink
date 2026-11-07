@@ -23,6 +23,8 @@ import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.connector.lance.converter.LanceTypeConverter;
 import org.apache.flink.connector.lance.converter.RowDataConverter;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -60,9 +62,12 @@ import java.util.List;
  *       都能用它建表（failover 后新 Writer 实例构造出的 committable 同样可建表）。
  * </ul>
  *
- * <p>孤儿文件：{@link Fragment#write()} 落盘的 {@code .lance} 文件在 TM crash 的
- * pre-commit 窗口内不被 commit 时会成为孤儿；交由 Lance 外部 compaction/cleanup
- * 清理。此行为与根 src/1.x 版 {@code LanceSink} 完全一致。
+ * <p><b>孤儿文件防护（#87）</b>：本类不再在 {@link #write(RowData, Context)} 内因
+ * {@code write.batch-size} 满而物化 {@code .lance} 文件；行先缓冲在内存，物化统一延迟到
+ * {@link #flush(boolean)} / {@link #prepareCommit()}。这样 TM 在 {@code write()} 与
+ * {@code prepareCommit()} 之间 crash 时，磁盘上还没有任何文件可成为孤儿，writer 保持无状态。
+ * 仅当估算的内存缓冲超过 {@code write.memory-cap-bytes} 时才会提前物化（OOM 安全阀，
+ * 会重新打开一个窄的 orphan 窗口；默认 -1 无上限，永不提前物化）。
  */
 public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommittable> {
 
@@ -79,8 +84,14 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     /** 当前 checkpoint 窗口内已 flush 产生、待 commit 的 fragments。 */
     private final List<FragmentMetadata> pendingFragments = new ArrayList<>();
 
-    /** 行级 buffer：满 batchSize 或 flush 时触发 Lance 写。 */
+    /** 行级内存 buffer：仅在 flush/prepareCommit 或 memory-cap 触发时物化。 */
     private final List<RowData> rowBuffer;
+
+    /** 每行的估算字节数（基于 rowType 字段类型的一次性估算，用于 memory-cap 触发）。 */
+    private final long rowBytesEstimate;
+
+    /** 当前 rowBuffer 的累计估算字节数。 */
+    private long estimatedBufferedBytes;
 
     private long totalRowsWritten;
 
@@ -98,6 +109,7 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
         this.converter = new RowDataConverter(rowType);
         this.arrowSchema = LanceTypeConverter.toArrowSchema(rowType);
         this.rowBuffer = new ArrayList<>(options.getWriteBatchSize());
+        this.rowBytesEstimate = estimateRowBytes(rowType);
 
         // OVERWRITE 预清理：必须发生在 Fragment.write() 之前。只允许 subtask 0 执行，
         // 其它 subtask 可能稍晚启动，等它们开始 write 时 drop 已完成。这里走 lance 侧
@@ -125,7 +137,13 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     @Override
     public void write(RowData element, Context context) throws IOException, InterruptedException {
         rowBuffer.add(element);
-        if (rowBuffer.size() >= options.getWriteBatchSize()) {
+        estimatedBufferedBytes += rowBytesEstimate;
+
+        // #87: 不再因 write.batch-size 满而物化；仅当内存缓冲超过 write.memory-cap-bytes
+        // 时提前物化（OOM 安全阀）。默认 -1（无上限）→ write() 阶段永不物化，彻底消除
+        // write() 与 prepareCommit() 之间的 orphan 文件窗口。
+        long memoryCap = options.getWriteMemoryCapBytes();
+        if (memoryCap >= 0 && estimatedBufferedBytes >= memoryCap) {
             writeBufferAsFragment();
         }
     }
@@ -197,6 +215,52 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
                     "Failed to write Lance fragment for path " + options.getPath(), e);
         } finally {
             rowBuffer.clear();
+            estimatedBufferedBytes = 0;
+        }
+    }
+
+    /**
+     * 估算单行的逻辑字节数（用于 memory-cap 触发判断，非精确值）。基于 rowType 的字段
+     * 类型给每个字段一个固定估算，可变长类型（字符串/二进制/复合类型等）取保守默认值。
+     */
+    private static long estimateRowBytes(RowType rowType) {
+        long bytes = 16; // RowData 对象本身 + 内部数组的固定 overhead
+        for (LogicalType type : rowType.getChildren()) {
+            bytes += estimateTypeBytes(type.getTypeRoot());
+        }
+        return Math.max(1, bytes);
+    }
+
+    private static long estimateTypeBytes(LogicalTypeRoot root) {
+        switch (root) {
+            case TINYINT:
+            case BOOLEAN:
+                return 1;
+            case SMALLINT:
+                return 2;
+            case INTEGER:
+            case FLOAT:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                return 4;
+            case BIGINT:
+            case DOUBLE:
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+            case TIMESTAMP_WITH_TIME_ZONE:
+            case INTERVAL_YEAR_MONTH:
+            case INTERVAL_DAY_TIME:
+                return 8;
+            case DECIMAL:
+                return 16;
+            case CHAR:
+            case VARCHAR:
+            case BINARY:
+            case VARBINARY:
+                return 32; // 可变长类型取保守估算
+            default:
+                // ARRAY / MAP / ROW / MULTISET / RAW / DISTINCT / STRUCTURED_TYPE / NULL 等
+                return 64; // 复合类型取保守估算
         }
     }
 
