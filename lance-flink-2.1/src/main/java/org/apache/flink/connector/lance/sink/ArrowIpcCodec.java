@@ -26,16 +26,18 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 
 /**
- * Arrow IPC stream 编解码工具：把 {@link VectorSchemaRoot} 序列化为字节数组。
+ * Arrow IPC stream codec: serializes a {@link VectorSchemaRoot} into a byte array.
  *
- * <p>upsert 路径与 append 路径的根本差异：{@code Dataset.mergeInsert} 消费的是<b>行数据</b>
- * （{@code ArrowArrayStream}），而非 fragment 元数据。因此 upsert 的 committable 必须跨
- * checkpoint / 网络携带序列化后的行数据，本类用 Arrow IPC stream 格式完成这一序列化，
- * 避免 Java 原生序列化（#88 已移除的安全面）。
+ * <p>The fundamental difference between the upsert path and the append path: {@code
+ * Dataset.mergeInsert} consumes <b>row data</b> ({@code ArrowArrayStream}) rather than fragment
+ * metadata. The upsert committable therefore has to carry serialized row data across checkpoint /
+ * network, and this class performs that serialization using the Arrow IPC stream format, avoiding
+ * Java native serialization (the attack surface removed by #88).
  *
- * <p>反序列化（byte[] → VectorSchemaRoot）由调用方内联 {@link org.apache.arrow.vector.ipc
- * .ArrowStreamReader} 完成，因为 reader 返回的 root 生命周期与 reader 绑定——必须在 reader
- * 打开期间同步消费完（{@link ArrowArrayStreams#mergeInsert} 恰好是同步的）。
+ * <p>Deserialization (byte[] → VectorSchemaRoot) is inlined by the caller via
+ * {@link org.apache.arrow.vector.ipc.ArrowStreamReader}, because the root returned by the reader
+ * is bound to the reader's lifetime and must be fully consumed while the reader is open
+ * ({@link ArrowArrayStreams#mergeInsert} happens to be synchronous).
  */
 public final class ArrowIpcCodec {
 
@@ -44,10 +46,10 @@ public final class ArrowIpcCodec {
     }
 
     /**
-     * 把单个 batch 的 {@link VectorSchemaRoot} 序列化为 Arrow IPC stream 字节。
+     * Serializes a single batch's {@link VectorSchemaRoot} into Arrow IPC stream bytes.
      *
-     * @param root 已填充数据的 root（须有正确 rowCount）
-     * @return Arrow IPC stream 字节（含 schema 头 + 单个 record batch + EOS）
+     * @param root a root populated with data (must have the correct rowCount)
+     * @return Arrow IPC stream bytes (schema header + single record batch + EOS)
      */
     public static byte[] serialize(VectorSchemaRoot root) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();

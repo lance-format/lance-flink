@@ -27,26 +27,27 @@
              replacing it, so the two coexist. -->
         <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
 
-        <!-- Lance Flink Connector 版本 -->
+        <!-- Lance Flink Connector version -->
         <lance-flink.version>0.1.0</lance-flink.version>
 
-        <!-- Lance 依赖版本 -->
+        <!-- Lance dependency version -->
         <lance.version>7.0.0</lance.version>
 
-        <!-- Lance Namespace 依赖版本（与 lance-spark 主分支保持一致） -->
+        <!-- Lance Namespace dependency version (kept in sync with the lance-spark main branch) -->
         <lance-namespace.version>0.7.5</lance-namespace.version>
 
-        <!-- Arrow 版本 (各版本模块可覆盖) -->
+        <!-- Arrow version (overridable per version module) -->
         <arrow.version>18.3.0</arrow.version>
 
-        <!-- Flink 多版本（注：1.17 已于 2024-10 EOL；1.18/1.19 自 Flink 2.1 支持落地起不再维护，
-             仅维护最后一个 1.x 稳定版 1.20 与首个 2.x 适配版 2.1.1） -->
+        <!-- Flink multi-version (note: 1.17 reached EOL in 2024-10; 1.18/1.19 are no longer
+             maintained once Flink 2.1 support landed, keeping only the last stable 1.x release
+             1.20 and the first 2.x adaptation 2.1.1) -->
         <flink120.version>1.20.0</flink120.version>
         <flink21.version>2.1.1</flink21.version>
-        <!-- 默认 Flink 版本，子模块覆盖 -->
+        <!-- Default Flink version, overridden by submodules -->
         <flink.version>${flink120.version}</flink.version>
 
-        <!-- 测试依赖版本 -->
+        <!-- Test dependency versions -->
         <junit.version>5.10.1</junit.version>
         <slf4j.version>1.7.36</slf4j.version>
         <log4j.version>2.20.0</log4j.version>
@@ -56,7 +57,7 @@
 
     <dependencyManagement>
         <dependencies>
-            <!-- ==================== Lance 依赖 ==================== -->
+            <!-- ==================== Lance dependencies ==================== -->
             <dependency>
                 <groupId>org.lance</groupId>
                 <artifactId>lance-core</artifactId>
@@ -80,18 +81,19 @@
                 <version>${arrow.version}</version>
             </dependency>
 
-            <!-- ==================== Lance Namespace（可插拔 Catalog 后端契约）==================== -->
-            <!-- LanceNamespace 接口与插件注册表，所有 catalog 操作通过此接口路由到具体实现
-                 （dir / rest / glue / hive2 / unity 等）。详见：
-                 https://github.com/lancedb/lance-namespace -->
+            <!-- ==================== Lance Namespace (pluggable catalog backend contract) ==================== -->
+            <!-- LanceNamespace interface and plugin registry; all catalog operations are routed
+                 through this interface to a concrete implementation (dir / rest / glue / hive2 /
+                 unity, etc.). See: https://github.com/lancedb/lance-namespace -->
             <dependency>
                 <groupId>org.lance</groupId>
                 <artifactId>lance-namespace-core</artifactId>
                 <version>${lance-namespace.version}</version>
             </dependency>
 
-            <!-- OpenAPI 生成的 Apache HTTP 客户端，提供 Request/Response 模型类
-                 （DescribeTableResponse / CreateTableRequest 等），以及 RestNamespace 实现 -->
+            <!-- OpenAPI-generated Apache HTTP client providing the Request/Response model classes
+                 (DescribeTableResponse / CreateTableRequest, etc.) and the RestNamespace
+                 implementation -->
             <dependency>
                 <groupId>org.lance</groupId>
                 <artifactId>lance-namespace-apache-client</artifactId>
@@ -117,7 +119,7 @@
                 <version>${arrow.version}</version>
             </dependency>
 
-            <!-- ==================== Flink 核心依赖 ==================== -->
+            <!-- ==================== Flink core dependencies ==================== -->
             <dependency>
                 <groupId>org.apache.flink</groupId>
                 <artifactId>flink-streaming-java</artifactId>
@@ -153,14 +155,14 @@
                 <scope>provided</scope>
             </dependency>
 
-            <!-- ==================== 日志依赖 ==================== -->
+            <!-- ==================== Logging dependencies ==================== -->
             <dependency>
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-api</artifactId>
                 <version>${slf4j.version}</version>
             </dependency>
 
-            <!-- ==================== 测试依赖 ==================== -->
+            <!-- ==================== Test dependencies ==================== -->
             <dependency>
                 <groupId>org.junit.jupiter</groupId>
                 <artifactId>junit-jupiter-api</artifactId>
@@ -266,7 +268,7 @@
     <build>
         <pluginManagement>
             <plugins>
-                <!-- Maven 编译插件 -->
+                <!-- Maven Compiler plugin -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-compiler-plugin</artifactId>
@@ -280,22 +282,24 @@
                     </configuration>
                 </plugin>
 
-                <!-- Maven Surefire 测试插件 -->
+                <!-- Maven Surefire plugin -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>3.1.2</version>
                     <configuration>
                         <!--
-                          Surefire 3.x 默认 includes 只匹配 **/Test*.java, **/*Test.java,
-                          **/*Tests.java, **/*TestCase.java 四个 pattern。本工程里关键的
-                          端到端集成测试全部按 *ITCase.java 命名（LanceConnectorITCase /
-                          LanceSqlITCase / LanceTimeTravelITCase / LanceUpsertSinkITCase /
+                          Surefire 3.x's default includes only match the four patterns
+                          **/Test*.java, **/*Test.java, **/*Tests.java and **/*TestCase.java.
+                          The key end-to-end integration tests in this project are all named
+                          *ITCase.java (LanceConnectorITCase / LanceSqlITCase /
+                          LanceTimeTravelITCase / LanceUpsertSinkITCase /
                           LanceSchemaEvolutionITCase / LanceSinkConcurrencyITCase /
                           CompositePkDeleteITCase / LanceNamespaceCatalogITCase /
-                          LanceCatalogTableITCase），加上 FlinkSqlDemo 里也有真实
-                          @Test。显式扩展 includes 使它们能被 surefire 执行，否则 CI 全
-                          绿但 2PC 核心路径未被覆盖。
+                          LanceCatalogTableITCase), plus FlinkSqlDemo also contains real
+                          @Test. Explicitly extending includes makes them executable by
+                          surefire; otherwise CI would be all-green while the 2PC core path
+                          is never covered.
                         -->
                         <includes>
                             <include>**/Test*.java</include>
@@ -308,14 +312,14 @@
                     </configuration>
                 </plugin>
 
-                <!-- Build Helper Maven Plugin (用于添加额外源码目录) -->
+                <!-- Build Helper Maven Plugin (adds extra source directories) -->
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>build-helper-maven-plugin</artifactId>
                     <version>3.4.0</version>
                 </plugin>
 
-                <!-- Maven Shade 插件 (打包 Fat JAR) -->
+                <!-- Maven Shade plugin (builds the fat JAR) -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-shade-plugin</artifactId>
@@ -368,7 +372,7 @@
                     </executions>
                 </plugin>
 
-                <!-- Maven JAR 插件 -->
+                <!-- Maven JAR plugin -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-jar-plugin</artifactId>
@@ -383,7 +387,7 @@
                     </configuration>
                 </plugin>
 
-                <!-- Maven Source 插件 -->
+                <!-- Maven Source plugin -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-source-plugin</artifactId>
@@ -398,7 +402,7 @@
                     </executions>
                 </plugin>
 
-                <!-- Maven Javadoc 插件 -->
+                <!-- Maven Javadoc plugin -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-javadoc-plugin</artifactId>
@@ -408,7 +412,7 @@
                     </configuration>
                 </plugin>
 
-                <!-- JaCoCo 代码覆盖率插件 -->
+                <!-- JaCoCo code coverage plugin -->
                 <plugin>
                     <groupId>org.jacoco</groupId>
                     <artifactId>jacoco-maven-plugin</artifactId>
@@ -429,7 +433,7 @@
                     </executions>
                 </plugin>
 
-                <!-- Maven Enforcer 插件 (强制 Maven 版本和依赖检查) -->
+                <!-- Maven Enforcer plugin (enforces Maven version and dependency checks) -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-enforcer-plugin</artifactId>
@@ -455,7 +459,7 @@
                     </executions>
                 </plugin>
 
-                <!-- Spotless 代码格式化插件 -->
+                <!-- Spotless code formatting plugin -->
                 <plugin>
                     <groupId>com.diffplug.spotless</groupId>
                     <artifactId>spotless-maven-plugin</artifactId>
@@ -509,8 +513,8 @@
     </build>
 
     <!--
-      PR#1 的 Source V2 骨架 + PR#2 的 Sink V2（TwoPhaseCommittingSink）已完整，
-      lance-flink-2.1 模块正式加入构建矩阵。
+      The Source V2 skeleton from PR#1 and the Sink V2 (TwoPhaseCommittingSink) from PR#2 are
+      complete, so the lance-flink-2.1 module officially joins the build matrix.
     -->
     <modules>
         <module>lance-flink-1.20</module>

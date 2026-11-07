@@ -24,10 +24,11 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * {@link LanceSplitEnumerator} 的快照状态：剩余未分配的 splits。
+ * Snapshot state of {@link LanceSplitEnumerator}: the remaining unassigned splits.
  *
- * <p>当发生 failover 时，Flink runtime 会用此状态重建 enumerator，
- * 已分配给 reader 但未完成的 split 由 reader 侧 report 回来再次纳入未分配集合。
+ * <p>On failover, the Flink runtime uses this state to rebuild the enumerator; splits that were
+ * assigned to a reader but not finished are reported back by the reader and re-added to the
+ * unassigned set.
  */
 public final class LanceEnumState {
 

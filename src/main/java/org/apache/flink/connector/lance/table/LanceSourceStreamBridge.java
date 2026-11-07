@@ -24,15 +24,16 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
 
 /**
- * Flink 版本桥接：把 {@link LanceSource} 挂载为 {@link DataStream}。
+ * Flink version bridge: mounts {@link LanceSource} as a {@link DataStream}.
  *
- * <p>本文件是「Flink 1.x 版本」：{@code LanceSource} 实现 {@code SourceFunction}，
- * 走 {@link StreamExecutionEnvironment#addSource}。
+ * <p>This file is the "Flink 1.x version": {@code LanceSource} implements {@code SourceFunction},
+ * mounted via {@link StreamExecutionEnvironment#addSource}.
  *
- * <p>{@code lance-flink-2.1} 子模块在同包下提供同名类的另一个实现（走 FLIP-27 的
- * {@code env.fromSource(Source, WatermarkStrategy.noWatermarks(), name)}），并通过
- * maven-compiler-plugin 的 {@code <excludes>} 把本文件从 2.1 的编译中排除，
- * 实现对上层 {@code LanceDynamicTableSource} 透明的版本切换。
+ * <p>The {@code lance-flink-2.1} submodule provides another implementation of the same class in the
+ * same package (using the FLIP-27
+ * {@code env.fromSource(Source, WatermarkStrategy.noWatermarks(), name)}), and excludes this file
+ * from the 2.1 compilation via the maven-compiler-plugin {@code <excludes>}, making the version
+ * switch transparent to the upper {@code LanceDynamicTableSource}.
  */
 final class LanceSourceStreamBridge {
 

@@ -257,7 +257,8 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     }
 
     /**
-     * 提取以 {@code hadoop.} 为前缀的选项 key，供 {@code validateExcept} 跳过校验。
+     * Extracts option keys prefixed with {@code hadoop.}, for {@code validateExcept} to skip
+     * validation.
      */
     private static String[] extractHadoopOptionKeys(Map<String, String> tableOptions) {
         if (tableOptions == null) {
@@ -269,13 +270,14 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     }
 
     /**
-     * {@link FactoryUtil.FactoryHelper#validateExcept(String...)} 在 Flink 2.1 收紧了
-     * 入参校验：{@code Preconditions.checkArgument(prefixesToSkip.length > 0,
-     * "Prefixes to skip can not be empty.")}。当 WITH 子句里没有任何 {@code hadoop.}
-     * 前缀选项时，{@link #extractHadoopOptionKeys(Map)} 返回空数组，直接把它传给
-     * {@code validateExcept} 会在 Flink 2.1 下抛 {@code IllegalArgumentException}。
-     * 这里做一层保护：有前缀才走 {@code validateExcept(prefixes)}，否则退回 {@code validate()}。
-     * 对 Flink 1.20 完全兼容，因为 1.x 不介意空 varargs。
+     * {@link FactoryUtil.FactoryHelper#validateExcept(String...)} tightened its argument validation
+     * in Flink 2.1: {@code Preconditions.checkArgument(prefixesToSkip.length > 0,
+     * "Prefixes to skip can not be empty.")}. When the WITH clause has no {@code hadoop.}-prefixed
+     * options, {@link #extractHadoopOptionKeys(Map)} returns an empty array, and passing it directly
+     * to {@code validateExcept} throws {@code IllegalArgumentException} under Flink 2.1. This method
+     * adds a guard: use {@code validateExcept(prefixes)} only when prefixes exist, otherwise fall
+     * back to {@code validate()}. It is fully compatible with Flink 1.20 since 1.x accepts empty
+     * varargs.
      */
     private static void validateOptionsSkippingHadoopPrefixes(
             FactoryUtil.TableFactoryHelper helper, Map<String, String> tableOptions) {
@@ -323,7 +325,8 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         builder.vectorMetric(LanceOptions.MetricType.fromValue(config.get(VECTOR_METRIC)));
         builder.vectorNprobes(config.get(VECTOR_NPROBES));
 
-        // Hadoop-family FileSystem 配置（例如 hadoop.tbdsfs.meta），用于 tbdsfs/hdfs 路径解析
+        // Hadoop-family FileSystem configuration (e.g. hadoop.tbdsfs.meta), used for tbdsfs/hdfs
+        // path resolution
         Map<String, String> hadoopConfig = extractHadoopConfig(tableOptions);
         if (!hadoopConfig.isEmpty()) {
             builder.hadoopConfig(hadoopConfig);
@@ -333,9 +336,10 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     }
 
     /**
-     * 从表 DDL 的原始 WITH 参数中提取以 {@code hadoop.} 为前缀的配置项，去掉前缀后作为
-     * Hadoop Configuration 的 key/value（例如 {@code 'hadoop.tbdsfs.meta' = 'zk://...'}
-     * → {@code tbdsfs.meta = zk://...}）。用于绕过集群部分节点 core-site.xml 缺配置的问题。
+     * Extracts {@code hadoop.}-prefixed configs from the raw WITH params of the table DDL, stripping
+     * the prefix and using the result as Hadoop Configuration key/value pairs (for example
+     * {@code 'hadoop.tbdsfs.meta' = 'zk://...'} → {@code tbdsfs.meta = zk://...}). Used to work
+     * around missing core-site.xml on some cluster nodes.
      */
     private Map<String, String> extractHadoopConfig(Map<String, String> tableOptions) {
         Map<String, String> result = new HashMap<>();

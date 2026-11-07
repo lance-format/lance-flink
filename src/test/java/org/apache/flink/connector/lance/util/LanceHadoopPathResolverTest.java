@@ -61,24 +61,24 @@ class LanceHadoopPathResolverTest {
 
     @Test
     void normalizeUriRestoresMissingSlashInAuthority() {
-        // 场景 1：Flink Path 反序列化把 "tbdsfs://internal/x" 变成 "tbdsfs:/internal/x"，
-        // normalizeUri 应恢复
+        // Case 1: Flink Path deserialization turns "tbdsfs://internal/x" into
+        // "tbdsfs:/internal/x"; normalizeUri should restore it.
         assertThat(LanceHadoopPathResolver.normalizeUri("tbdsfs:/internal/lance_poc/db1"))
                 .isEqualTo("tbdsfs://internal/lance_poc/db1");
-        // 场景 2：hdfs://ns1/path 也一样
+        // Case 2: hdfs://ns1/path behaves the same.
         assertThat(LanceHadoopPathResolver.normalizeUri("hdfs:/ns1/path"))
                 .isEqualTo("hdfs://ns1/path");
     }
 
     @Test
     void normalizeUriIsIdempotent() {
-        // 已经是双斜杠不变
+        // Already has double slash: unchanged.
         assertThat(LanceHadoopPathResolver.normalizeUri("tbdsfs://internal/x"))
                 .isEqualTo("tbdsfs://internal/x");
-        // 空 authority 的 "scheme:///" 也不变
+        // "scheme:///" with empty authority is also unchanged.
         assertThat(LanceHadoopPathResolver.normalizeUri("file:///tmp/x"))
                 .isEqualTo("file:///tmp/x");
-        // 本地路径不变
+        // Local paths are unchanged.
         assertThat(LanceHadoopPathResolver.normalizeUri("/tmp/x")).isEqualTo("/tmp/x");
         assertThat(LanceHadoopPathResolver.normalizeUri(null)).isNull();
     }
@@ -129,13 +129,13 @@ class LanceHadoopPathResolverTest {
     }
 
     /**
-     * 使用自定义 scheme {@code mytestfs://}（lance 不原生支持），并通过 Hadoop
-     * 配置将该 scheme 重定向到 {@link org.apache.hadoop.fs.LocalFileSystem}，从而完整
-     * 走通 Hadoop FS 下载链路，且不依赖真实 HDFS。
+     * Uses the custom {@code mytestfs://} scheme (not natively supported by Lance) and
+     * redirects it to {@link org.apache.hadoop.fs.LocalFileSystem} via Hadoop configuration,
+     * exercising the full Hadoop FS download path without depending on a real HDFS.
      */
     @Test
     void resolveForReadDownloadsFromHadoopFileSystem() throws IOException {
-        // 1. 构造一个“源” lance dataset 目录（用本地磁盘模拟）
+        // 1. Build a "source" lance dataset directory (simulated on local disk).
         Path srcDir = tempDir.resolve("src_dataset.lance");
         Path versionsDir = srcDir.resolve("_versions");
         Path dataDir = srcDir.resolve("data");
@@ -145,18 +145,19 @@ class LanceHadoopPathResolverTest {
         Files.write(dataDir.resolve("part-0.lance"), "hello".getBytes());
         Files.write(srcDir.resolve("_latest.manifest"), new byte[] {9});
 
-        // 2. 配置：把自定义 scheme mytestfs 重定向到 Hadoop LocalFileSystem
+        // 2. Configure: redirect the custom mytestfs scheme to Hadoop LocalFileSystem.
         Configuration conf = new Configuration(false);
         conf.set("fs.mytestfs.impl", LocalFsWithMytestfsScheme.class.getName());
 
-        // 3. 使用 mytestfs:// 前缀访问源目录，触发 Hadoop FS 下载路径
+        // 3. Access the source directory via the mytestfs:// prefix to trigger the
+        // Hadoop FS download path.
         String srcUri = "mytestfs://" + srcDir.toAbsolutePath();
         Path cacheRoot = tempDir.resolve("cache");
 
         String resolved = LanceHadoopPathResolver.resolveForRead(
                 srcUri, conf, cacheRoot.toAbsolutePath().toString());
 
-        // 4. 验证返回的是本地 file:// 路径，并且包含预期的文件
+        // 4. Verify the result is a local file:// path containing the expected files.
         assertThat(resolved).startsWith("file://");
         Path resolvedDir = Path.of(resolved.substring("file://".length()));
         assertThat(Files.isDirectory(resolvedDir)).isTrue();
@@ -167,7 +168,7 @@ class LanceHadoopPathResolverTest {
     }
 
     /**
-     * 二次 resolve 相同 URI 时应命中缓存，不重复下载。
+     * Resolving the same URI a second time should hit the cache without re-downloading.
      */
     @Test
     void resolveForReadReusesCacheOnSecondCall() throws IOException {
@@ -184,22 +185,24 @@ class LanceHadoopPathResolverTest {
 
         String first = LanceHadoopPathResolver.resolveForRead(
                 srcUri, conf, cacheRoot.toAbsolutePath().toString());
-        // 修改缓存目录里的文件，模拟“已存在的缓存”
+        // Modify a file in the cached directory to simulate an existing cache.
         Path firstDir = Path.of(first.substring("file://".length()));
         Path sentinel = firstDir.resolve("_versions/1.manifest");
         Files.write(sentinel, new byte[] {42});
 
         String second = LanceHadoopPathResolver.resolveForRead(
                 srcUri, conf, cacheRoot.toAbsolutePath().toString());
-        // 第二次 resolve 应返回同一个目录，且 sentinel 未被重新下载覆盖
+        // The second resolve should return the same directory, and the sentinel must not
+        // be overwritten by a re-download.
         assertThat(second).isEqualTo(first);
         assertThat(Files.readAllBytes(sentinel)).containsExactly(42);
     }
 
     /**
-     * 将 Hadoop {@link org.apache.hadoop.fs.LocalFileSystem} 包装为 {@code mytestfs://} scheme，
-     * 测试专用。它仅重写 {@link #getScheme()} 以及将传入的 {@code mytestfs://<abs-path>}
-     * URI 重写为能被本地文件系统接受的 {@code file:/<abs-path>} 后转发到 LocalFileSystem。
+     * Wraps Hadoop {@link org.apache.hadoop.fs.LocalFileSystem} as the {@code mytestfs://}
+     * scheme for test purposes. It only overrides {@link #getScheme()} and rewrites incoming
+     * {@code mytestfs://<abs-path>} URIs into {@code file:/<abs-path>} (accepted by the local
+     * filesystem) before forwarding to LocalFileSystem.
      */
     public static final class LocalFsWithMytestfsScheme extends org.apache.hadoop.fs.LocalFileSystem {
         @Override
@@ -219,7 +222,7 @@ class LanceHadoopPathResolverTest {
 
         @Override
         protected void checkPath(org.apache.hadoop.fs.Path path) {
-            // 接受任意 scheme（mytestfs 或 file）
+            // Accept any scheme (mytestfs or file).
         }
 
         @Override
@@ -250,7 +253,7 @@ class LanceHadoopPathResolverTest {
             java.net.URI u = p.toUri();
             String path = u.getPath();
             if (u.getAuthority() != null && !u.getAuthority().isEmpty()) {
-                // mytestfs://<abs-path> 会把绝对路径的首段解析为 authority
+                // mytestfs://<abs-path> parses the first segment of the absolute path as authority.
                 path = "/" + u.getAuthority() + (path == null ? "" : path);
             }
             return new org.apache.hadoop.fs.Path("file://" + path);

@@ -40,90 +40,95 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 方案 B：Hadoop FileSystem 前置缓存层。
+ * Plan B: a Hadoop FileSystem front cache layer.
  *
- * <p>Lance 底层通过 lance-core（Rust）直接读取存储，其 {@code object_store} 只支持
- * 一组硬编码 scheme（{@code file/s3/gs/az/abfss/oss/cos/hf/memory}）。对于
- * {@code tbdsfs://} / {@code hdfs://} 等 Hadoop 生态的 scheme，Lance 无法识别。
+ * <p>Lance reads storage directly through lance-core (Rust), whose {@code object_store} only
+ * supports a hard-coded set of schemes ({@code file/s3/gs/az/abfss/oss/cos/hf/memory}). For
+ * Hadoop-ecosystem schemes such as {@code tbdsfs://} / {@code hdfs://}, Lance cannot recognize
+ * them.
  *
- * <p>本工具类的职责：在 {@code Dataset.open(uri)} 调用之前，如果 {@code uri} 是
- * Hadoop 兼容的 scheme（且不在 Lance 原生支持列表内），则：
+ * <p>The responsibility of this utility: before calling {@code Dataset.open(uri)}, if {@code uri}
+ * uses a Hadoop-compatible scheme (and is not in Lance's native supported list), then:
  * <ol>
- *   <li>通过 Hadoop {@link FileSystem} 打开源目录；</li>
- *   <li>递归把整个 lance dataset 目录同步到本地临时缓存目录；</li>
- *   <li>返回本地 {@code file:///...} 路径给 Lance。</li>
+ *   <li>open the source directory via the Hadoop {@link FileSystem};</li>
+ *   <li>recursively sync the entire lance dataset directory to a local temporary cache directory;</li>
+ *   <li>return the local {@code file:///...} path to Lance.</li>
  * </ol>
  *
- * <p><b>使用条件</b>：需要在 classpath 中提供对应 scheme 的 Hadoop {@code FileSystem}
- * 实现（例如 tbdsfs 需要 {@code tbdsfs-hadoop-*.jar}）。这些 jar 在 TBDS 集群的
- * {@code /usr/local/service/flink/lib/} 下由集群提供，因此 lance-flink 本身
- * 无需绑定。
+ * <p><b>Prerequisite</b>: the Hadoop {@code FileSystem} implementation for the corresponding
+ * scheme must be on the classpath (for example, tbdsfs needs {@code tbdsfs-hadoop-*.jar}). On
+ * TBDS clusters these jars are provided under {@code /usr/local/service/flink/lib/}, so
+ * lance-flink itself does not need to bundle them.
  *
- * <p><b>限制</b>：当前实现为整目录 <b>读时全量拷贝</b>，对小/中等规模 lance dataset
- * 有效；对超大 dataset 建议后续演进为 range-read 或增量同步策略。
+ * <p><b>Limitation</b>: the current implementation performs a full <b>read-time copy</b> of the
+ * entire directory, which works for small/medium-sized lance datasets; for very large datasets it
+ * should evolve into range-read or incremental sync strategies.
  *
- * <p>本类线程安全；对同一源路径的并发 resolve 请求会串行化为一次下载。
+ * <p>This class is thread-safe; concurrent resolve requests for the same source path are
+ * serialized into a single download.
  */
 public final class LanceHadoopPathResolver {
 
     private static final Logger LOG = LoggerFactory.getLogger(LanceHadoopPathResolver.class);
 
-    /** Lance native object_store 支持的 scheme，遇到这些直接透传。 */
+    /** Schemes supported by Lance's native object_store; these are passed through directly. */
     private static final Set<String> LANCE_NATIVE_SCHEMES = Collections.unmodifiableSet(
             new HashSet<>(Arrays.asList(
                     "file", "s3", "s3+ddb", "gs", "az", "abfss", "oss", "cos",
                     "hf", "memory", "file+uring", "shared-memory", "file-object-store"
             )));
 
-    /** 每个进程内所有已缓存的源 URI → 本地路径映射；同时兼作锁监视器。 */
+    /** Per-process map of cached source URI → local path; also doubles as the lock monitor. */
     private static final ConcurrentHashMap<String, Object> CACHE_LOCKS = new ConcurrentHashMap<>();
 
     /**
-     * Lance 的 latest 版本哨兵号（{@code u64::MAX - 1}）。Lance 在 {@code _versions/} 目录下
-     * 用它标记"最新版本"的别名 manifest。该文件并非真实数据，Lance 在缺失时可通过扫描
-     * {@code _versions/} 下的最大版本号确定 latest，因此对它读取失败时可安全跳过。
-     * 部分 tbdsfs 后端会把这个哨兵 manifest 存坏（读时报 input/output error）。
+     * The sentinel version number for Lance's "latest" marker ({@code u64::MAX - 1}). Lance uses it
+     * under the {@code _versions/} directory to alias the "latest version" manifest. This file is
+     * not real data; Lance can determine the latest version by scanning for the max version number
+     * under {@code _versions/}, so a read failure on it can be safely skipped. Some tbdsfs backends
+     * store this sentinel manifest incorrectly (returning input/output error on read).
      */
     private static final String LATEST_MANIFEST_SENTINEL = "18446744073709551614";
 
     private LanceHadoopPathResolver() {}
 
     /**
-     * 解析 URI，如果需要则把远端 lance dataset 目录同步到本地缓存，返回可以直接
-     * 传给 {@code Dataset.open()} 的路径。
+     * Resolves a URI, syncing the remote lance dataset directory to a local cache when needed, and
+     * returns a path that can be passed directly to {@code Dataset.open()}.
      *
-     * @param sourceUri     用户配置的 lance dataset URI，可能是
-     *                      {@code /local/path}、{@code file:///...}、{@code s3://...}、
-     *                      {@code tbdsfs://...}、{@code hdfs://...} 等
-     * @param hadoopConf    Hadoop 配置（可为 {@code null}，此时使用默认 {@link Configuration}）
-     * @param localCacheRoot 本地缓存根目录（可为 {@code null}，此时使用系统默认
-     *                       {@code java.io.tmpdir/lance-hadoop-cache}）
-     * @return 可直接传给 lance-core 的路径（本地路径或原路径透传）
+     * @param sourceUri      the user-configured lance dataset URI, which may be
+     *                       {@code /local/path}, {@code file:///...}, {@code s3://...},
+     *                       {@code tbdsfs://...}, {@code hdfs://...}, etc.
+     * @param hadoopConf    Hadoop configuration (may be {@code null}; a default
+     *                      {@link Configuration} is used then)
+     * @param localCacheRoot local cache root directory (may be {@code null}; defaults to
+     *                       {@code java.io.tmpdir/lance-hadoop-cache})
+     * @return a path that can be passed directly to lance-core (local path or the original path)
      */
     public static String resolveForRead(String sourceUri, Configuration hadoopConf,
                                         String localCacheRoot) {
         if (sourceUri == null || sourceUri.isEmpty()) {
             return sourceUri;
         }
-        // 规范化 URI：某些上游（如 Flink Table planner / Path 反序列化）会把
-        // "scheme://authority/path" 收敛成 "scheme:/authority/path"（单斜杠），
-        // 导致 URI.getAuthority() 变为 null，进而丢失 tbdsfs 需要的 name。
-        // 这里通过把 "scheme:/xxx"（且不是 "scheme:///"）恢复为 "scheme://xxx"。
+        // Normalize the URI: some upstreams (e.g. Flink Table planner / Path deserialization)
+        // collapse "scheme://authority/path" into "scheme:/authority/path" (single slash), making
+        // URI.getAuthority() return null and losing the name tbdsfs requires. Here we restore
+        // "scheme:/xxx" (but not "scheme:///") back to "scheme://xxx".
         sourceUri = normalizeUri(sourceUri);
 
         String scheme = extractScheme(sourceUri);
         if (scheme == null || LANCE_NATIVE_SCHEMES.contains(scheme)) {
-            // 无 scheme（当作本地路径）或 lance 原生支持的 scheme，透传
+            // No scheme (treated as local path) or a scheme natively supported by Lance: pass through.
             return sourceUri;
         }
 
-        // 需要走 Hadoop FS 缓存
+        // Needs to go through the Hadoop FS cache.
         Configuration conf = buildHadoopConfiguration(hadoopConf);
         applySchemeSpecificDefaults(conf, sourceUri, scheme);
         java.nio.file.Path cacheRoot = resolveCacheRoot(localCacheRoot);
         java.nio.file.Path targetDir = cacheRoot.resolve(sanitize(sourceUri));
 
-        // 串行化并发访问：同一个 sourceUri 只下载一次
+        // Serialize concurrent access: download the same sourceUri only once.
         Object lock = CACHE_LOCKS.computeIfAbsent(sourceUri, k -> new Object());
         synchronized (lock) {
             try {
@@ -150,31 +155,34 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 构造 Hadoop {@link Configuration}：
+     * Builds a Hadoop {@link Configuration}:
      * <ol>
-     *   <li>如果用户传入 {@code userConf}，以他为基础；否则新建一个（会自动
-     *       加载 classpath 上的 {@code core-site.xml}）。</li>
-     *   <li>扫描以 {@code lance.hadoop.} 为前缀的系统属性，去前缀后注入 Configuration。
-     *       例如 {@code -Dlance.hadoop.fs.tbdsfs.impl=io.tbdsfs.TbdsFileSystem} 会被
-     *       映射为 Hadoop 配置 {@code fs.tbdsfs.impl}。</li>
-     *   <li>扫描以 {@code LANCE_HADOOP_} 为前缀的环境变量，以下划线为分隔符。
-     *       例如 {@code LANCE_HADOOP_TBDSFS_META=zk://host:port} 会被映射为
-     *       {@code tbdsfs.meta}。</li>
+     *   <li>If {@code userConf} is provided, use it as the base; otherwise create a new one (which
+     *       auto-loads {@code core-site.xml} from the classpath).</li>
+     *   <li>Scan system properties prefixed with {@code lance.hadoop.}, strip the prefix and inject
+     *       them into the Configuration. For example
+     *       {@code -Dlance.hadoop.fs.tbdsfs.impl=io.tbdsfs.TbdsFileSystem} maps to the Hadoop
+     *       config {@code fs.tbdsfs.impl}.</li>
+     *   <li>Scan environment variables prefixed with {@code LANCE_HADOOP_}, using underscore as a
+     *       separator. For example {@code LANCE_HADOOP_TBDSFS_META=zk://host:port} maps to
+     *       {@code tbdsfs.meta}.</li>
      * </ol>
      *
-     * <p>处于 Flink TaskManager 环境中时，由于 YARN 容器不一定可以看到宿主机的
-     * {@code core-site.xml}，上述两种方式作为兽底的配置注入通道。
+     * <p>In a Flink TaskManager environment, YARN containers may not see the host's
+     * {@code core-site.xml}, so the two mechanisms above act as fallback configuration injection
+     * channels.
      */
     static Configuration buildHadoopConfiguration(Configuration userConf) {
         Configuration conf = userConf != null ? userConf : new Configuration();
 
-        // 显式加载 core-site.xml / hdfs-site.xml。在 Flink YARN TaskManager 容器内，
-        // 由于 Flink 的 child-first 类加载器隔离，new Configuration() 未必能通过
-        // context classloader 加载到宿主机的 core-site.xml，导致 tbdsfs.meta 等配置
-        // 缺失（tbdsfs 的 Go 库会因此报 invalid uri 并 fatal）。这里按标准路径兜底加载。
+        // Explicitly load core-site.xml / hdfs-site.xml. Inside a Flink YARN TaskManager container,
+        // Flink's child-first classloader isolation means new Configuration() may not load the
+        // host's core-site.xml through the context classloader, causing tbdsfs.meta etc. to be
+        // missing (tbdsfs's Go library then fails with "invalid uri" and fatals). Load them here
+        // from standard paths as a fallback.
         loadHadoopSiteXmls(conf);
 
-        // 1. 从系统属性注入 lance.hadoop.* -> hadoop conf key
+        // 1. Inject system properties lance.hadoop.* -> hadoop conf key
         java.util.Properties props = System.getProperties();
         for (String key : props.stringPropertyNames()) {
             if (key.startsWith("lance.hadoop.")) {
@@ -185,7 +193,7 @@ public final class LanceHadoopPathResolver {
             }
         }
 
-        // 2. 从环境变量注入 LANCE_HADOOP_XXX -> hadoop conf key
+        // 2. Inject environment variables LANCE_HADOOP_XXX -> hadoop conf key
         java.util.Map<String, String> env = System.getenv();
         for (java.util.Map.Entry<String, String> e : env.entrySet()) {
             if (e.getKey().startsWith("LANCE_HADOOP_")) {
@@ -201,20 +209,21 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 从 Flink 的全局配置构造 Hadoop {@link Configuration}。
+     * Builds a Hadoop {@link Configuration} from Flink's global configuration.
      *
-     * <p>Flink SQL 里通过 {@code SET 'flink.hadoop.xxx' = 'yyy'} 设置的配置会以
-     * {@code flink.hadoop.} 前缀进入 Flink 的 {@code Configuration}。这里把这些
-     * 前缀剥掉后注入 Hadoop {@code Configuration}（例如 {@code flink.hadoop.tbdsfs.meta}
-     * → {@code tbdsfs.meta}）。
+     * <p>Configurations set via {@code SET 'flink.hadoop.xxx' = 'yyy'} in Flink SQL enter Flink's
+     * {@code Configuration} with the {@code flink.hadoop.} prefix. Here we strip that prefix and
+     * inject them into the Hadoop {@code Configuration} (for example {@code flink.hadoop.tbdsfs.meta}
+     * → {@code tbdsfs.meta}).
      *
-     * <p>这解决了在 YARN TaskManager 容器内 {@code new Configuration()} 因类加载器
-     * 隔离而加载不到宿主机的 {@code core-site.xml}（进而拿不到 {@code tbdsfs.meta}）
-     * 的问题——tbdsfs 的 Go 库在 {@code meta} 为空时会 fallback 到把 name 当 URI，
-     * 报 {@code invalid uri: /internal} 并直接 fatal 退出。
+     * <p>This solves the problem where, inside a YARN TaskManager container,
+     * {@code new Configuration()} cannot load the host's {@code core-site.xml} (and therefore
+     * {@code tbdsfs.meta}) due to classloader isolation — tbdsfs's Go library, when {@code meta} is
+     * empty, falls back to treating the name as a URI, reporting {@code invalid uri: /internal} and
+     * directly fataling out.
      *
-     * @param flinkConf Flink 运行时配置（可为 {@code null}）
-     * @return 注入了 {@code flink.hadoop.*} 配置的 Hadoop {@code Configuration}
+     * @param flinkConf Flink runtime configuration (may be {@code null})
+     * @return a Hadoop {@code Configuration} with {@code flink.hadoop.*} settings injected
      */
     public static Configuration buildHadoopConfigurationFromFlink(
             org.apache.flink.configuration.Configuration flinkConf) {
@@ -234,27 +243,29 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 针对特定 scheme 应用兜底默认值：
+     * Applies fallback defaults for a specific scheme:
      * <ul>
-     *   <li>{@code tbdsfs://<authority>/...}：tbdsfs 的 {@code TbdsFileSystemImpl.initialize}
-     *       要求 {@code tbdsfs.name} 配置存在。如果用户未显式配置且 URI 的 authority 非空，
-     *       则自动把 authority 作为 {@code tbdsfs.name} 注入。同时保证
-     *       {@code fs.tbdsfs.impl} 存在（默认 {@code io.tbdsfs.TbdsFileSystem}）。</li>
+     *   <li>{@code tbdsfs://<authority>/...}: tbdsfs's {@code TbdsFileSystemImpl.initialize}
+     *       requires the {@code tbdsfs.name} config to exist. If the user has not set it explicitly
+     *       and the URI's authority is non-empty, the authority is automatically injected as
+     *       {@code tbdsfs.name}. It also ensures {@code fs.tbdsfs.impl} exists (defaulting to
+     *       {@code io.tbdsfs.TbdsFileSystem}).</li>
      * </ul>
      *
-     * <p>该方法只做"缺省填充"，永远不会覆盖用户已经显式设置的值。
+     * <p>This method only fills in missing values; it never overrides values the user has already
+     * set explicitly.
      */
     static void applySchemeSpecificDefaults(Configuration conf, String sourceUri, String scheme) {
         if (conf == null || scheme == null) return;
         if (!"tbdsfs".equals(scheme)) return;
 
-        // 1. 确保 fs.tbdsfs.impl 存在
+        // 1. Ensure fs.tbdsfs.impl exists.
         if (conf.get("fs.tbdsfs.impl") == null) {
             conf.set("fs.tbdsfs.impl", "io.tbdsfs.TbdsFileSystem");
             LOG.info("Applied default fs.tbdsfs.impl = io.tbdsfs.TbdsFileSystem");
         }
 
-        // 2. 如果 tbdsfs.name 未配置，从 URI authority 推导
+        // 2. If tbdsfs.name is not configured, derive it from the URI authority.
         if (conf.get("tbdsfs.name") == null) {
             try {
                 URI u = new URI(sourceUri);
@@ -270,35 +281,35 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 规范化 URI：如果输入形如 {@code scheme:/authority/path}（单斜杠，authority 与 path
-     * 之间没有明确分隔），将其转换为 {@code scheme://authority/path}（双斜杠）。
-     * 常见触发场景是 Flink Table 反序列化 URI 时 {@code new Path(str)} 会丢失一个斜杠。
-     * 幂等：对已经形如 {@code scheme://...} 或 {@code scheme:///...}（无 authority）的
-     * URI 不做任何改动。
+     * Normalizes a URI: if the input is of the form {@code scheme:/authority/path} (single slash,
+     * no clear separator between authority and path), it is converted to
+     * {@code scheme://authority/path} (double slash). A common trigger is Flink Table
+     * deserializing a URI via {@code new Path(str)}, which drops a slash. Idempotent: URIs already
+     * of the form {@code scheme://...} or {@code scheme:///...} (no authority) are left unchanged.
      */
     static String normalizeUri(String uri) {
         if (uri == null) return null;
         int colon = uri.indexOf(':');
         if (colon <= 0 || colon >= uri.length() - 1) return uri;
         String rest = uri.substring(colon + 1);
-        // 如果已经是 "//..."（含空 authority 的 "///..."），保持原样
+        // If it is already "//..." (including "///..." with empty authority), keep as-is.
         if (rest.startsWith("//")) return uri;
-        // 只处理 "scheme:/xxx" 且第 2 个字符不是 '/'（否则已经是双斜杠了）
+        // Only handle "scheme:/xxx" where the second char is not '/' (otherwise it is already double slash).
         if (rest.startsWith("/") && !rest.startsWith("//")) {
             String scheme = uri.substring(0, colon);
-            return scheme + ":/" + rest;   // 把 "scheme:/xxx" 变为 "scheme://xxx"
+            return scheme + ":/" + rest;   // turn "scheme:/xxx" into "scheme://xxx"
         }
         return uri;
     }
 
-    /** 提取 scheme。返回小写 scheme，如果没有 scheme 返回 {@code null}。 */
+    /** Extracts the scheme. Returns the lower-cased scheme, or {@code null} if there is none. */
     static String extractScheme(String uri) {
         try {
             URI u = new URI(uri);
             String s = u.getScheme();
             return s == null ? null : s.toLowerCase(Locale.ROOT);
         } catch (URISyntaxException e) {
-            // 非标 URI（比如 Windows 路径 C:\），当作本地路径
+            // Non-standard URI (e.g. a Windows path C:\), treat as a local path.
             return null;
         }
     }
@@ -308,9 +319,9 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 显式加载 Hadoop 的 {@code core-site.xml} / {@code hdfs-site.xml}。
-     * 用于兜底 Flink YARN 容器内 {@code new Configuration()} 因类加载器隔离而
-     * 加载不到宿主机 site 文件的问题。
+     * Explicitly loads Hadoop's {@code core-site.xml} / {@code hdfs-site.xml}. Used as a fallback
+     * for the case where, inside a Flink YARN container, {@code new Configuration()} cannot load
+     * the host's site files due to classloader isolation.
      */
     private static void loadHadoopSiteXmls(Configuration conf) {
         java.nio.file.Path confDir = resolveHadoopConfDir();
@@ -328,7 +339,7 @@ public final class LanceHadoopPathResolver {
         }
     }
 
-    /** 探测 Hadoop 配置目录：HADOOP_CONF_DIR → 系统属性 → TBDS 标准路径。 */
+    /** Probes the Hadoop configuration directory: HADOOP_CONF_DIR → system property → TBDS standard path. */
     private static java.nio.file.Path resolveHadoopConfDir() {
         String env = System.getenv("HADOOP_CONF_DIR");
         if (env != null && !env.isEmpty()) {
@@ -353,12 +364,12 @@ public final class LanceHadoopPathResolver {
         return java.nio.file.Paths.get(tmpDir, "lance-hadoop-cache");
     }
 
-    /** 把 URI 转为可作为文件系统目录名的安全字符串。 */
+    /** Converts a URI into a safe string usable as a filesystem directory name. */
     private static String sanitize(String uri) {
         return uri.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
-    /** 缓存目录是否已经就绪（存在 {@code _versions/} 子目录，Lance dataset 的标志）。 */
+    /** Whether the cache directory is ready (has a {@code _versions/} subdirectory, the Lance dataset marker). */
     private static boolean isCacheReady(java.nio.file.Path targetDir) {
         if (!Files.isDirectory(targetDir)) return false;
         java.nio.file.Path versionsDir = targetDir.resolve("_versions");
@@ -366,8 +377,8 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 递归把 {@code srcDir} 下的所有文件同步到 {@code destDir}（本地目录）。
-     * 保留相对目录结构。
+     * Recursively syncs all files under {@code srcDir} to {@code destDir} (a local directory),
+     * preserving the relative directory structure.
      */
     private static void downloadDirectory(Path srcDir, java.nio.file.Path destDir,
                                           Configuration conf) throws IOException {
@@ -391,14 +402,15 @@ public final class LanceHadoopPathResolver {
             String rel = relativize(srcDir, srcFile);
             java.nio.file.Path dst = destDir.resolve(rel);
             Files.createDirectories(dst.getParent());
-            // 使用 copyToLocalFile：deleteSource=false, useRawLocalFileSystem=true 避免 checksum 校验
+            // Use copyToLocalFile: deleteSource=false, useRawLocalFileSystem=true to avoid checksum validation.
             try {
                 fs.copyToLocalFile(false, srcFile, new Path(dst.toUri()), true);
                 fileCount++;
                 byteCount += st.getLen();
             } catch (IOException e) {
-                // latest 哨兵 manifest（u64::MAX-1）只是 latest 版本的别名，损坏/不可读
-                // 不影响 Lance 通过扫描 _versions 目录确定 latest，因此安全跳过。
+                // The latest sentinel manifest (u64::MAX-1) is only an alias of the latest version;
+                // being corrupt/unreadable does not stop Lance from determining the latest by scanning
+                // the _versions directory, so it is safely skipped.
                 if (isLatestSentinelManifest(rel)) {
                     LOG.warn("Skipping unreadable latest-sentinel manifest {} (tbdsfs read error: {})",
                             srcFile, e.getMessage());
@@ -413,8 +425,8 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 判断相对路径 {@code rel} 是否指向 Lance 的 latest 哨兵 manifest
-     * （即 {@code _versions/18446744073709551614.manifest}）。
+     * Determines whether the relative path {@code rel} points to Lance's latest sentinel manifest
+     * (i.e. {@code _versions/18446744073709551614.manifest}).
      */
     private static boolean isLatestSentinelManifest(String rel) {
         if (rel == null) return false;
@@ -424,7 +436,8 @@ public final class LanceHadoopPathResolver {
     }
 
     /**
-     * 计算 {@code srcFile} 相对 {@code srcDir} 的路径字符串，永远使用 '/' 分隔符。
+     * Computes the path of {@code srcFile} relative to {@code srcDir}, always using '/' as the
+     * separator.
      */
     private static String relativize(Path srcDir, Path srcFile) {
         String base = srcDir.toUri().getPath();
@@ -433,7 +446,7 @@ public final class LanceHadoopPathResolver {
         if (full.startsWith(base)) {
             return full.substring(base.length());
         }
-        // Fallback：直接取文件名
+        // Fallback: take the file name directly.
         return srcFile.getName();
     }
 }

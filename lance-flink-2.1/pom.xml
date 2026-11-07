@@ -33,17 +33,17 @@
     <packaging>jar</packaging>
 
     <properties>
-        <!-- Flink 2.1 要求 JDK 17 -->
+        <!-- Flink 2.1 requires JDK 17 -->
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <flink.version>${flink21.version}</flink.version>
 
         <!--
-          JDK 17 下 Arrow 通过反射访问 java.nio.Buffer.address、Netty 访问
-          sun.nio.ch.DirectBuffer 均需显式 "add-opens" 参数。Flink 2.1 的
-          flink-runtime 也要求 java.util / java.lang 的若干模块开放。
-          surefire/failsafe 读取 ${argLine}，jacoco:prepare-agent 会追加
-          javaagent 到此属性而非覆盖。
+          On JDK 17, Arrow accesses java.nio.Buffer.address via reflection and Netty accesses
+          sun.nio.ch.DirectBuffer, both requiring explicit "add-opens" flags. Flink 2.1's
+          flink-runtime also requires opening several java.util / java.lang modules.
+          surefire/failsafe read ${argLine}, and jacoco:prepare-agent appends its javaagent to
+          this property rather than replacing it.
         -->
         <argLine>
             --add-opens=java.base/java.nio=ALL-UNNAMED
@@ -88,7 +88,7 @@
             <artifactId>arrow-c-data</artifactId>
         </dependency>
 
-        <!-- ==================== Flink 2.1（Scala-free，artifactId 不再带 _2.12 后缀） ==================== -->
+        <!-- ==================== Flink 2.1 (Scala-free; artifactId no longer carries the _2.12 suffix) ==================== -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-streaming-java</artifactId>
@@ -114,9 +114,9 @@
             <artifactId>flink-connector-base</artifactId>
         </dependency>
 
-        <!-- Hadoop：JDK 17 需要 3.4.x 以上才能干净运行（3.3.x 在 JDK 17 下
-             会命中 sun.nio.ch.DirectBuffer 的反射限制，需额外 add-opens；
-             由集群提供，scope=provided 不打进 fat jar） -->
+        <!-- Hadoop: JDK 17 needs 3.4.x or later to run cleanly (3.3.x hits the
+             sun.nio.ch.DirectBuffer reflection restriction on JDK 17 and needs extra
+             add-opens; provided by the cluster, so scope=provided keeps it out of the fat jar) -->
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
@@ -138,13 +138,13 @@
             </exclusions>
         </dependency>
 
-        <!-- ==================== 日志 ==================== -->
+        <!-- ==================== Logging ==================== -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
 
-        <!-- ==================== 测试依赖 ==================== -->
+        <!-- ==================== Test dependencies ==================== -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
@@ -165,8 +165,9 @@
             <artifactId>flink-test-utils</artifactId>
         </dependency>
 
-        <!-- flink-core:tests 提供 MockSplitEnumeratorContext（org.apache.flink.api
-             .connector.source.mocks 包）用于 B2 新增的 SplitEnumerator 单元测试。 -->
+        <!-- flink-core:tests provides MockSplitEnumeratorContext (the
+             org.apache.flink.api.connector.source.mocks package) for the SplitEnumerator
+             unit tests added in B2. -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-core</artifactId>
@@ -187,9 +188,10 @@
             <type>test-jar</type>
         </dependency>
 
-        <!-- Flink 2.x 的 planner artifactId 已经从 flink-table-planner_2.12 变为
-             flink-table-planner-loader（独立 classloader 隔离 Scala 版本）。
-             原 flink-table-planner artifact 不发布到 Maven Central，必须配合 flink-table-runtime 使用。 -->
+        <!-- Flink 2.x's planner artifactId has changed from flink-table-planner_2.12 to
+             flink-table-planner-loader (an isolated classloader that decouples the Scala
+             version). The old flink-table-planner artifact is not published to Maven Central
+             and must be paired with flink-table-runtime. -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-table-planner-loader</artifactId>
@@ -242,16 +244,17 @@
 
     <build>
         <!--
-          版本隔离策略：
-          共享源码位于根目录 ../src/main/java，但其中 LanceSource / LanceSink /
-          LanceAggregateSource 基于 Flink 1.x 的 SourceFunction / SinkFunction
-          API 实现，在 Flink 2.1 已被移除，无法编译。
-          本模块通过：
-            1. build-helper-maven-plugin 把 ../src/main/java 加入源码目录；
-            2. maven-compiler-plugin 的 <excludes> 把这三个类从编译中剔除；
-            3. 本模块 src/main/java 下提供基于 FLIP-27 Source V2 /
-               TwoPhaseCommittingSink 的替代实现，类名、包名与被排除类保持一致，
-               从而对上层 LanceDynamicTableSource/Sink 调用透明。
+          Version isolation strategy:
+          Shared source lives in ../src/main/java, but LanceSource / LanceSink /
+          LanceAggregateSource there are implemented against Flink 1.x's SourceFunction /
+          SinkFunction APIs, which were removed in Flink 2.1 and can no longer compile.
+          This module therefore:
+            1. uses build-helper-maven-plugin to add ../src/main/java to the source directories;
+            2. uses maven-compiler-plugin <excludes> to drop those three classes from compilation;
+            3. provides, under this module's src/main/java, FLIP-27 Source V2 /
+               TwoPhaseCommittingSink replacement implementations with the same class and
+               package names as the excluded classes, keeping the switch transparent to the
+               upper-layer LanceDynamicTableSource/Sink callers.
         -->
         <plugins>
             <plugin>
@@ -319,8 +322,9 @@
                 <configuration>
                     <source>${maven.compiler.source}</source>
                     <target>${maven.compiler.target}</target>
-                    <!-- 把基于 Flink 1.x 的 Source/Sink Function 实现从本模块编译中剔除；
-                         本模块 src/main/java 下有同名同包的 Flink 2.x 版本替代实现 -->
+                    <!-- Drop the Flink 1.x-based Source/Sink Function implementations from this
+                         module's compilation; this module's src/main/java provides same-named,
+                         same-package Flink 2.x replacement implementations -->
                     <excludes>
                         <exclude>org/apache/flink/connector/lance/LanceSource.java</exclude>
                         <exclude>org/apache/flink/connector/lance/LanceAggregateSource.java</exclude>

@@ -51,33 +51,34 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Lance {@link SourceReader} 实现。
+ * Lance {@link SourceReader} implementation.
  *
- * <p>职责：
+ * <p>Responsibilities:
  * <ul>
- *   <li>管理当前正在读取的 {@link LanceSplit} 及其底层 {@link LanceScanner} / {@link ArrowReader}；
- *   <li>一个 split 结束后自动关闭 scanner 并切换到队列中的下一个 split；
- *   <li>所有 split 都读完且 enumerator 已 signalNoMoreSplits 时返回 {@link InputStatus#END_OF_INPUT}；
- *   <li>supports limit push-down：命中 limit 立即结束。
+ *   <li>Manages the current {@link LanceSplit} and its underlying {@link LanceScanner} / {@link ArrowReader};
+ *   <li>Closes the scanner when a split finishes and switches to the next split in the queue;
+ *   <li>Returns {@link InputStatus#END_OF_INPUT} once all splits are consumed and the enumerator has signalled no more splits;
+ *   <li>Supports limit push-down: stops immediately once the limit is reached.
  * </ul>
  *
- * <p>懒加载策略：构造函数不打开 Lance dataset，首次 {@link #pollNext(ReaderOutput)} 收到
- * split 时才打开，避免并行度大于 split 数时产生无谓的 Dataset 句柄。
+ * <p>Lazy initialization: the constructor does not open the Lance dataset; it is opened on the
+ * first {@link #pollNext(ReaderOutput)} that receives a split, avoiding pointless Dataset handles
+ * when parallelism exceeds the number of splits.
  *
- * <p>Availability 协议（M1 修复）：遵守 FLIP-27 的
- * {@link SourceReader#isAvailable()} 契约——当 {@link #pollNext} 返回
- * {@link InputStatus#NOTHING_AVAILABLE} 时，{@link #isAvailable()} 必须返回一个
- * **尚未 complete** 的 future，runtime 看到该 future 完成后才会重新调度 reader。
- * 本实现用 volatile {@link CompletableFuture} 字段：{@link #resetAvailability()} 在
- * {@code pollNext} 决定返回 {@code NOTHING_AVAILABLE} 之前新建一个 incomplete future；
- * {@link #addSplits(List)} 和 {@link #notifyNoMoreSplits()} 收到新事件时 complete 当前
- * future 唤醒 runtime。
+ * <p>Availability protocol (M1 fix): follows the FLIP-27
+ * {@link SourceReader#isAvailable()} contract — when {@link #pollNext} returns
+ * {@link InputStatus#NOTHING_AVAILABLE}, {@link #isAvailable()} must return a
+ * **not-yet-completed** future, and the runtime re-schedules the reader only after that future
+ * completes. This implementation uses a volatile {@link CompletableFuture} field:
+ * {@link #resetAvailability()} creates a new incomplete future before {@code pollNext} decides to
+ * return {@code NOTHING_AVAILABLE}; {@link #addSplits(List)} and {@link #notifyNoMoreSplits()}
+ * complete the current future to wake the runtime when new events arrive.
  */
 public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
 
     private static final Logger LOG = LoggerFactory.getLogger(LanceSourceReader.class);
 
-    /** 哨兵：已完成的 future，供"有数据可用"的初态复用，避免每次 pollNext 都 new。 */
+    /** Sentinel: a completed future reused for the initial "data available" state, avoiding a new future per pollNext. */
     private static final CompletableFuture<Void> COMPLETED = CompletableFuture.completedFuture(null);
 
     private final SourceReaderContext context;
@@ -89,18 +90,18 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
     private final Deque<LanceSplit> pendingSplits = new ArrayDeque<>();
 
     /**
-     * 当前的 availability future。读写都在 runtime 的 task thread 上发生，但
-     * {@link #addSplits}/{@link #notifyNoMoreSplits} 可能被 enumerator 回调线程调用，
-     * 故声明为 volatile 以保证可见性。
+     * The current availability future. Reads/writes happen on the runtime task thread, but
+     * {@link #addSplits}/{@link #notifyNoMoreSplits} may be invoked by the enumerator callback
+     * thread, so it is declared volatile for visibility.
      */
     private volatile CompletableFuture<Void> availabilityFuture = COMPLETED;
 
-    // 延迟初始化：首个 split 到达时才真正打开 Lance dataset
+    // Lazy initialization: the Lance dataset is only opened when the first split arrives
     private BufferAllocator allocator;
     private Dataset dataset;
     private RowDataConverter converter;
 
-    // 当前 split 的游标
+    // Cursor for the current split
     private LanceSplit currentSplit;
     private LanceScanner currentScanner;
     private ArrowReader currentReader;
@@ -123,7 +124,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
 
     @Override
     public void start() {
-        // 启动时主动请求第一个 split
+        // Actively request the first split on startup
         context.sendSplitRequest();
     }
 
@@ -134,7 +135,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
             return InputStatus.END_OF_INPUT;
         }
 
-        // 1) 若当前 batch 还有残留行，优先消费
+        // 1) Consume leftover rows in the current batch first
         if (currentBatchIter.hasNext()) {
             RowData row = currentBatchIter.next();
             output.collect(row);
@@ -144,41 +145,42 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
                     : (currentBatchIter.hasNext() ? InputStatus.MORE_AVAILABLE : advanceBatch());
         }
 
-        // 2) 当前 batch 空：尝试拉下一个 batch
+        // 2) Current batch exhausted: try to pull the next batch
         if (currentReader != null) {
             return advanceBatch();
         }
 
-        // 3) 当前没有 scanner：尝试切换到下一个 split
+        // 3) No current scanner: try to switch to the next split
         LanceSplit next = pendingSplits.pollFirst();
         if (next != null) {
             openSplit(next);
             return advanceBatch();
         }
 
-        // 4) 没有 split 可用
+        // 4) No split available
         if (noMoreSplits) {
             return InputStatus.END_OF_INPUT;
         }
-        // 发请求等待 enumerator 分配；在声明 NOTHING_AVAILABLE 之前先重置 availability future，
-        // 这样 isAvailable() 返回未完成的 future，runtime 不会立即重新调度本 reader
-        // （避免 CPU busy loop）。等 addSplits/notifyNoMoreSplits 回调时再 complete。
+        // Request a split from the enumerator; reset the availability future before declaring
+        // NOTHING_AVAILABLE so isAvailable() returns an incomplete future and the runtime does
+        // not immediately re-schedule this reader (avoids a CPU busy loop). It is completed later
+        // by the addSplits/notifyNoMoreSplits callbacks.
         resetAvailability();
         context.sendSplitRequest();
         return InputStatus.NOTHING_AVAILABLE;
     }
 
     /**
-     * 从当前 reader 加载下一个 Arrow batch，返回对应的 InputStatus。
+     * Loads the next Arrow batch from the current reader and returns the corresponding InputStatus.
      */
     private InputStatus advanceBatch() throws Exception {
         if (currentReader == null) {
             return InputStatus.NOTHING_AVAILABLE;
         }
         if (!currentReader.loadNextBatch()) {
-            // 当前 split 读完
+            // Current split fully read
             closeCurrentSplit();
-            // 立刻尝试切换到下一个 split（如果队列里已经有）
+            // Immediately try to switch to the next split (if already queued)
             LanceSplit next = pendingSplits.pollFirst();
             if (next != null) {
                 openSplit(next);
@@ -208,7 +210,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
 
         switch (split.getKind()) {
             case WHOLE_DATASET: {
-                // filter / limit 走 dataset 级 scan
+                // filter / limit go through a dataset-level scan
                 String filter = options.getReadFilter();
                 if (filter != null && !filter.isEmpty()) {
                     sb.filter(filter);
@@ -282,8 +284,8 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
     }
 
     /**
-     * 新建一个未完成的 availability future（如果当前 future 已完成）。
-     * 后续 {@link #addSplits}/{@link #notifyNoMoreSplits} 会 complete 它，唤醒 runtime。
+     * Creates a new incomplete availability future (if the current one is already completed).
+     * It is completed later by {@link #addSplits}/{@link #notifyNoMoreSplits} to wake the runtime.
      */
     private void resetAvailability() {
         CompletableFuture<Void> current = this.availabilityFuture;
@@ -292,7 +294,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
         }
     }
 
-    /** 唤醒当前阻塞的 availability future（如果有）。 */
+    /** Wakes the currently blocked availability future, if any. */
     private void completeAvailability() {
         CompletableFuture<Void> current = this.availabilityFuture;
         if (current != null && !current.isDone()) {
@@ -302,7 +304,8 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
 
     @Override
     public List<LanceSplit> snapshotState(long checkpointId) {
-        // 当前 split + 待处理 split 都算未完成，交回 enumerator 以便 failover 时重分配
+        // The current split plus all pending splits count as unfinished and are handed back to the
+        // enumerator for reassignment on failover.
         List<LanceSplit> state = new ArrayList<>(pendingSplits.size() + 1);
         if (currentSplit != null) {
             state.add(currentSplit);
@@ -313,8 +316,9 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
 
     @Override
     public CompletableFuture<Void> isAvailable() {
-        // 直接返回当前 future：有数据可用（COMPLETED）→ runtime 立即调 pollNext；
-        // 等待 split 分配中（未完成的 future）→ runtime 挂起本 reader 直到 complete。
+        // Return the current future directly: data available (COMPLETED) → runtime immediately
+        // calls pollNext; awaiting split assignment (incomplete future) → runtime suspends this
+        // reader until completion.
         return availabilityFuture;
     }
 
@@ -322,7 +326,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
     public void addSplits(List<LanceSplit> splits) {
         LOG.debug("Reader {} received {} split(s)", context.getIndexOfSubtask(), splits.size());
         pendingSplits.addAll(splits);
-        // 新数据到达，立刻唤醒 runtime 调度 pollNext
+        // New data arrived, wake the runtime to schedule pollNext immediately
         completeAvailability();
     }
 
@@ -330,7 +334,7 @@ public class LanceSourceReader implements SourceReader<RowData, LanceSplit> {
     public void notifyNoMoreSplits() {
         LOG.debug("Reader {} notified: no more splits", context.getIndexOfSubtask());
         this.noMoreSplits = true;
-        // enumerator 声明不再有新 split，唤醒 runtime 让 pollNext 走 END_OF_INPUT
+        // Enumerator declared no more splits, wake the runtime so pollNext returns END_OF_INPUT
         completeAvailability();
     }
 

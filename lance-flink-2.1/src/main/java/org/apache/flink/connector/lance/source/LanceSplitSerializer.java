@@ -25,11 +25,12 @@ import org.apache.flink.core.memory.DataOutputSerializer;
 import java.io.IOException;
 
 /**
- * {@link LanceSplit} 的序列化器。
+ * Serializer for {@link LanceSplit}.
  *
- * <p>编码格式（version=1）：{@code [kind:byte][fragmentId:long][splitId:utf]}。
- * byte 枚举编码避免写入字符串 enum name 浪费空间；splitId 单独写入以保持与 kind 的无关性，
- * 便于未来扩展其它 split 语义时不改变旧版本解码。
+ * <p>Encoding format (version=1): {@code [kind:byte][fragmentId:long][splitId:utf]}.
+ * The byte enum encoding avoids the space waste of writing the string enum name; splitId is written
+ * separately to keep it independent of kind, making it easy to extend other split semantics in the
+ * future without changing the old-version decoding.
  */
 public final class LanceSplitSerializer implements SimpleVersionedSerializer<LanceSplit> {
 

@@ -33,20 +33,21 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * {@link LanceUpsertCommittable} 的序列化器。
+ * Serializer for {@link LanceUpsertCommittable}.
  *
- * <p>编码格式（version=1）：
+ * <p>Encoding format (version=1):
  * <pre>
  *   [datasetPath:utf]
  *   [writeMode:byte]                                  // 0 = APPEND, 1 = OVERWRITE
  *   [primaryKeyCount:int][primaryKey...:utf]
- *   [schemaJsonLen:int][schemaJson:bytes]             // Arrow Schema 的 JSON 表示（可能为空）
- *   [upsertBatchLen:int][upsertBatch:bytes]           // Arrow IPC stream 字节（+I/+U 行）
- *   [deleteBatchLen:int][deleteBatch:bytes]           // Arrow IPC stream 字节（-D 行）
+ *   [schemaJsonLen:int][schemaJson:bytes]             // JSON representation of the Arrow Schema (may be empty)
+ *   [upsertBatchLen:int][upsertBatch:bytes]           // Arrow IPC stream bytes (+I/+U rows)
+ *   [deleteBatchLen:int][deleteBatch:bytes]           // Arrow IPC stream bytes (-D rows)
  * </pre>
  *
- * <p>两批行数据是 Arrow IPC stream 字节（见 {@link ArrowIpcCodec}），不是 Java 原生序列化，
- * 延续 #88 移除 {@code ObjectOutputStream} 的安全策略。Arrow Schema 走 JSON 文本往返。
+ * <p>Both row batches are Arrow IPC stream bytes (see {@link ArrowIpcCodec}), not Java native
+ * serialization, continuing the #88 security policy of removing {@code ObjectOutputStream}.
+ * The Arrow Schema round-trips as JSON text.
  */
 public final class LanceUpsertCommittableSerializer
         implements SimpleVersionedSerializer<LanceUpsertCommittable> {

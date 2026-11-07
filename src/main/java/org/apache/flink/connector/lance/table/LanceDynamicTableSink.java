@@ -98,9 +98,9 @@ public class LanceDynamicTableSink implements DynamicTableSink {
         if (primaryKeys.isEmpty()) {
             // Append-only path: keep the existing LanceSink.
             LanceSink lanceSink = new LanceSink(options, rowType);
-            // 版本桥接：Flink 1.x 走 SinkFunctionProvider.of（SinkFunction 已在 2.x 移除），
-            // Flink 2.x 走 SinkV2Provider.of。具体实现由各 flink 版本子模块下的
-            // LanceSinkProviderBridge 提供。
+            // Version bridge: Flink 1.x uses SinkFunctionProvider.of (SinkFunction is removed in 2.x),
+            // Flink 2.x uses SinkV2Provider.of. The concrete implementation is provided by the
+            // LanceSinkProviderBridge under each Flink-version submodule.
             return LanceSinkProviderBridge.toProvider(lanceSink);
         }
 

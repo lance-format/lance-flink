@@ -109,16 +109,18 @@ public class LanceDynamicTableSource implements ScanTableSource,
         LanceOptions finalOptions = buildRuntimeOptions(rowType);
         final RowType finalRowType = projectedRowType;
 
-        // Use DataStreamScanProvider. 实现 Flink 2.x 的新签名 produceDataStream(ProviderContext, env)，
-        // Flink 1.20 仍保留旧签名作为 default 方法，因此本实现同时兼容 1.20 和 2.1。
+        // Use DataStreamScanProvider. Implement Flink 2.x's new signature
+        // produceDataStream(ProviderContext, env); Flink 1.20 still keeps the old signature as a
+        // default method, so this implementation is compatible with both 1.20 and 2.1.
         return new DataStreamScanProvider() {
             @Override
             public DataStream<RowData> produceDataStream(
                     ProviderContext providerContext, StreamExecutionEnvironment execEnv) {
                 LanceSource source = new LanceSource(finalOptions, finalRowType);
-                // 版本桥接：Flink 1.x 走 env.addSource(SourceFunction, name)，
-                // Flink 2.x 走 env.fromSource(Source, WatermarkStrategy.noWatermarks(), name)。
-                // 具体实现由各 flink 版本子模块下的 LanceSourceStreamBridge 提供。
+                // Version bridge: Flink 1.x uses env.addSource(SourceFunction, name),
+                // Flink 2.x uses env.fromSource(Source, WatermarkStrategy.noWatermarks(), name).
+                // The concrete implementation is provided by the LanceSourceStreamBridge under each
+                // Flink-version submodule.
                 return LanceSourceStreamBridge.toStream(execEnv, source, "LanceSource");
             }
 
@@ -143,7 +145,8 @@ public class LanceDynamicTableSource implements ScanTableSource,
                 .readBatchSize(options.getReadBatchSize())
                 .readFilter(buildFilterExpression());
 
-        // 携带 hadoop.* 配置（如 tbdsfs.meta），避免投影/过滤下推重建 options 时丢失
+        // Carry hadoop.* configs (such as tbdsfs.meta) so they are not lost when projection/filter
+        // push-down rebuilds the options.
         if (options.getHadoopConfig() != null && !options.getHadoopConfig().isEmpty()) {
             optionsBuilder.hadoopConfig(options.getHadoopConfig());
         }
@@ -193,8 +196,9 @@ public class LanceDynamicTableSource implements ScanTableSource,
 
     @Override
     public void applyProjection(int[][] projectedFields, DataType producedDataType) {
-        // Only support top-level field projection；producedDataType 由 planner 传入，
-        // 表示投影之后的输出 schema，本连接器后续按 projectedFields 自行推导，故不直接使用。
+        // Only support top-level field projection; producedDataType is passed in by the planner and
+        // represents the post-projection output schema. This connector derives it later from
+        // projectedFields, so it is not used directly.
         this.projectedFields = Arrays.stream(projectedFields)
                 .mapToInt(arr -> arr[0])
                 .toArray();

@@ -48,13 +48,13 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Sink V2 版本的主键 upsert ITCase：驱动 {@link LanceUpsertWriter}（缓冲 + 序列化）
- * 与 {@link LanceUpsertCommitter}（串行 mergeInsert）验证 {@code +I/+U/-D} 语义。
+ * Sink V2 primary-key upsert ITCase: drives {@link LanceUpsertWriter} (buffer + serialize)
+ * and {@link LanceUpsertCommitter} (serial mergeInsert) to verify {@code +I/+U/-D} semantics.
  *
- * <p>这是根 src 中 1.x {@code LanceUpsertSinkITCase}（{@code RichSinkFunction} 的
- * {@code open/invoke/flush/close} 生命周期）在 Flink 2.1 下的等价重写；根 src 的 1.x
- * 版本已删除（其测试的 RichSinkFunction 生命周期在 Flink 2.x 已移除），本类以同名同包
- * 的 Sink V2 形式承载 upsert 语义测试。
+ * <p>This is the Flink 2.1 equivalent rewrite of the 1.x {@code LanceUpsertSinkITCase} in the
+ * root src (which used the {@code RichSinkFunction} {@code open/invoke/flush/close} lifecycle);
+ * the 1.x version has been deleted (its RichSinkFunction lifecycle was removed in Flink 2.x), and
+ * this class carries the upsert semantics tests in the Sink V2 form under the same package and name.
  */
 class LanceUpsertSinkITCase {
 
@@ -101,7 +101,7 @@ class LanceUpsertSinkITCase {
     }
 
     // ------------------------------------------------------------------------
-    // Sink V2 生命周期驱动：writer.write → writer.prepareCommit → committer.commit
+    // Sink V2 lifecycle: writer.write -> writer.prepareCommit -> committer.commit
     // ------------------------------------------------------------------------
 
     private void write(LanceUpsertWriter writer, RowData... rows) throws Exception {
@@ -119,7 +119,7 @@ class LanceUpsertSinkITCase {
         committer.commit(requests);
     }
 
-    /** 单窗口写入 + 提交。 */
+    /** Write + commit in a single window. */
     private void writeAndCommit(
             String path, int subtaskId, RowData... rows) throws Exception {
         try (LanceUpsertWriter writer =
@@ -132,11 +132,11 @@ class LanceUpsertSinkITCase {
     }
 
     // ------------------------------------------------------------------------
-    // 测试
+    // Tests
     // ------------------------------------------------------------------------
 
     @Test
-    @DisplayName("首次写入建表并持久化主键")
+    @DisplayName("First write creates the dataset and persists primary keys")
     void firstWriteCreatesDatasetAndPersistsPrimaryKey() throws Exception {
         String path = tempDir.resolve("first").toString();
         writeAndCommit(path, 0, row(1L, "alice", RowKind.INSERT), row(2L, "bob", RowKind.INSERT));
@@ -149,7 +149,7 @@ class LanceUpsertSinkITCase {
     }
 
     @Test
-    @DisplayName("+U(k) 覆盖旧值")
+    @DisplayName("+U(k) replaces the previous value")
     void updateAfterReplacesPreviousValue() throws Exception {
         String path = tempDir.resolve("update").toString();
         writeAndCommit(path, 0, row(1L, "old", RowKind.INSERT));
@@ -164,7 +164,7 @@ class LanceUpsertSinkITCase {
     }
 
     @Test
-    @DisplayName("-D(k) 删除已有 key；删不存在的 key 幂等")
+    @DisplayName("-D(k) deletes an existing key; deleting an absent key is idempotent")
     void deleteRemovesKeyAndReplayIsIdempotent() throws Exception {
         String path = tempDir.resolve("delete").toString();
         writeAndCommit(path, 0, row(1L, "alice", RowKind.INSERT), row(2L, "bob", RowKind.INSERT));
@@ -177,19 +177,19 @@ class LanceUpsertSinkITCase {
             assertThat(ds.countRows("id = 2")).isEqualTo(1L);
         }
 
-        // 重放 delete（checkpoint 回放）—— 删不存在的 key 是 no-op
+        // Replay the delete (checkpoint replay) -- deleting an absent key is a no-op
         writeAndCommit(path, 0, row(1L, "alice", RowKind.DELETE));
         assertThat(countRows(path)).isEqualTo(1L);
     }
 
     @Test
-    @DisplayName("同一窗口 +I(k) 然后 -D(k) → k 不存在")
+    @DisplayName("+I(k) then -D(k) in the same window leaves k absent")
     void insertThenDeleteSameWindowLeavesKeyAbsent() throws Exception {
         String path = tempDir.resolve("insert_then_delete").toString();
-        // 先种子一行，使 dataset 已存在
+        // Seed one row first so the dataset already exists
         writeAndCommit(path, 0, row(1L, "alice", RowKind.INSERT));
 
-        // 同一窗口 +I(1) 再 -D(1)：先 upsert 后 delete，最终 1 不存在
+        // Same window +I(1) then -D(1): upsert first, then delete, so 1 ends up absent
         try (LanceUpsertWriter writer =
                      new LanceUpsertWriter(options(path), rowType(), PRIMARY_KEYS, 0);
              LanceUpsertCommitter committer = new LanceUpsertCommitter()) {
@@ -201,7 +201,7 @@ class LanceUpsertSinkITCase {
     }
 
     @Test
-    @DisplayName("两个 subtask 并发首次写入不同 key 不丢数据")
+    @DisplayName("Two subtasks concurrently first-write distinct keys without data loss")
     void twoSubtasksConcurrentFirstWrite() throws Exception {
         String path = tempDir.resolve("concurrent_first").toString();
 
@@ -216,7 +216,8 @@ class LanceUpsertSinkITCase {
             all.addAll(w2.prepareCommit());
         }
 
-        // 串行 committer 处理两条 committable：首条建表，次条 mergeInsert，不丢数据
+        // The serial committer processes two committables: the first creates the table,
+        // the second mergeInserts, with no data loss
         try (LanceUpsertCommitter committer = new LanceUpsertCommitter()) {
             commit(committer, all);
         }

@@ -23,32 +23,35 @@ import org.apache.flink.api.connector.source.SourceSplit;
 import java.util.Objects;
 
 /**
- * Lance 数据源的 split 单元。
+ * Split unit of the Lance source.
  *
- * <p>两种语义：
+ * <p>Two semantics:
  * <ul>
- *   <li>{@link Kind#FRAGMENT}：对应 Lance Dataset 的一个 Fragment（无 filter / limit 时按 Fragment 并行扫描）；
- *   <li>{@link Kind#WHOLE_DATASET}：当存在 filter 或 limit 时，整表只产出 1 个此类 split，
- *       由单个 reader 处理，等价于旧实现中「仅 subtask 0 执行」的降级策略。
+ *   <li>{@link Kind#FRAGMENT}: corresponds to one Fragment of the Lance Dataset (parallel scan by
+ *       Fragment when there is no filter / limit);
+ *   <li>{@link Kind#WHOLE_DATASET}: when a filter or limit is present, the whole table produces
+ *       only 1 such split, handled by a single reader — equivalent to the old "only subtask 0 runs"
+ *       fallback strategy.
  * </ul>
  *
- * <p>此类不可变，可直接作为 {@link org.apache.flink.api.connector.source.SplitEnumerator}
- * 分发给 {@link org.apache.flink.api.connector.source.SourceReader} 的载荷。
+ * <p>This class is immutable and can be directly used as the payload dispatched by
+ * {@link org.apache.flink.api.connector.source.SplitEnumerator} to a
+ * {@link org.apache.flink.api.connector.source.SourceReader}.
  */
 public final class LanceSplit implements SourceSplit {
 
-    /** split 语义。 */
+    /** Split semantics. */
     public enum Kind {
-        /** 单个 Fragment 切片。 */
+        /** A single Fragment slice. */
         FRAGMENT,
-        /** 整表 scan（filter 或 limit 场景）。 */
+        /** Whole-table scan (filter or limit scenario). */
         WHOLE_DATASET
     }
 
     private final String splitId;
     private final Kind kind;
 
-    /** 仅 FRAGMENT 类型使用；WHOLE_DATASET 时为 -1。 */
+    /** Used only by the FRAGMENT kind; -1 for WHOLE_DATASET. */
     private final long fragmentId;
 
     public LanceSplit(String splitId, Kind kind, long fragmentId) {
