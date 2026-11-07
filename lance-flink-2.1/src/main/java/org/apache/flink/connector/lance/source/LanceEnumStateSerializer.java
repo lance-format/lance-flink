@@ -27,10 +27,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * {@link LanceEnumState} 的序列化器：复用 {@link LanceSplitSerializer} 作为元素编码。
+ * Serializer for {@link LanceEnumState}: reuses {@link LanceSplitSerializer} as the element codec.
  *
- * <p>编码格式（version=1）：{@code [count:int][elementVersion:int][len:int][bytes]...}。
- * 单独写出元素版本号便于后续 split 结构演进时的向后兼容。
+ * <p>Encoding format (version=1): {@code [count:int][elementVersion:int][len:int][bytes]...}.
+ * The element version is written separately to allow backward compatibility when the split
+ * structure evolves.
  */
 public final class LanceEnumStateSerializer implements SimpleVersionedSerializer<LanceEnumState> {
 

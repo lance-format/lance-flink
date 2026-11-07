@@ -327,8 +327,9 @@ public class LanceReadOptimizationsTest {
 
             // Select only id column
             int[][] projection = {{0}};  // First column
-            // Flink 2.1 新签名 applyProjection(int[][], DataType) ——本连接器不使用
-            // producedDataType，测试场景下传 null 对行为无影响。以下全部 applyProjection 调用同此处理。
+            // Flink 2.1 new signature applyProjection(int[][], DataType) — this connector does not use
+            // producedDataType; passing null in the test has no effect on behavior. All applyProjection
+            // calls below follow the same treatment.
             source.applyProjection(projection, null);
 
             // Verify projection is applied

@@ -115,10 +115,11 @@ public class LanceOptions implements Serializable {
     /**
      * Write batch size
      *
-     * <p>注意（#87）：此参数控制的是 <b>flush 粒度</b>，而非磁盘物化粒度。Writer 不再在
-     * {@code write()} 内因 batch-size 满而物化 {@code .lance} 文件；物化统一延迟到
-     * {@code flush()} / {@code prepareCommit()}。仅当内存缓冲超过
-     * {@link #WRITE_MEMORY_CAP_BYTES} 时才会提前物化（安全阀，见该选项）。
+     * <p>Note (#87): this parameter controls <b>flush granularity</b>, not disk materialization
+     * granularity. The writer no longer materializes {@code .lance} files inside {@code write()}
+     * when the batch size is reached; materialization is uniformly deferred to {@code flush()} /
+     * {@code prepareCommit()}. Early materialization only happens when the in-memory buffer exceeds
+     * {@link #WRITE_MEMORY_CAP_BYTES} (safety valve, see that option).
      */
     public static final ConfigOption<Integer> WRITE_BATCH_SIZE = ConfigOptions
             .key("write.batch-size")
@@ -132,10 +133,11 @@ public class LanceOptions implements Serializable {
     /**
      * Write memory cap in bytes
      *
-     * <p>防止 {@code write()} 阶段内存缓冲无限增长（#87）：当估算的缓冲字节数超过该上限时，
-     * writer 会提前物化以释放内存（这会重新打开一个窄的 orphan-file 窗口）。默认 -1 表示无上限，
-     * 此时 {@code write()} 阶段永不物化、彻底消除 orphan 窗口，但内存压力随 checkpoint interval
-     * 增长——长 checkpoint interval 的作业建议显式设置一个上限。
+     * <p>Prevents unbounded in-memory buffering during {@code write()} (#87): when the estimated
+     * buffered bytes exceed this cap, the writer materializes early to free memory (which reopens a
+     * narrow orphan-file window). The default -1 means unbounded, in which case {@code write()}
+     * never materializes and the orphan window is fully eliminated, but memory pressure grows with
+     * the checkpoint interval — jobs with long checkpoint intervals should set an explicit cap.
      */
     public static final ConfigOption<Long> WRITE_MEMORY_CAP_BYTES = ConfigOptions
             .key("write.memory-cap-bytes")

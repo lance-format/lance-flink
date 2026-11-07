@@ -23,14 +23,16 @@ import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.SinkFunctionProvider;
 
 /**
- * Flink 版本桥接：把 {@link LanceSink} 包装为 {@link DynamicTableSink.SinkRuntimeProvider}。
+ * Flink version bridge: wraps {@link LanceSink} into a
+ * {@link DynamicTableSink.SinkRuntimeProvider}.
  *
- * <p>本文件是「Flink 1.x 版本」：{@code LanceSink} 实现 {@code SinkFunction}，
- * 用 {@link SinkFunctionProvider#of(org.apache.flink.streaming.api.functions.sink.SinkFunction)} 包装。
+ * <p>This file is the "Flink 1.x version": {@code LanceSink} implements {@code SinkFunction},
+ * wrapped via
+ * {@link SinkFunctionProvider#of(org.apache.flink.streaming.api.functions.sink.SinkFunction)}.
  *
- * <p>{@code lance-flink-2.1} 子模块在同包下提供同名类的另一个实现
- * （用 {@code SinkV2Provider.of(Sink)}），并通过 maven-compiler-plugin 的
- * {@code <excludes>} 把本文件从 2.1 的编译中排除。
+ * <p>The {@code lance-flink-2.1} submodule provides another implementation of the same class in the
+ * same package (using {@code SinkV2Provider.of(Sink)}), and excludes this file from the 2.1
+ * compilation via the maven-compiler-plugin {@code <excludes>}.
  */
 final class LanceSinkProviderBridge {
 

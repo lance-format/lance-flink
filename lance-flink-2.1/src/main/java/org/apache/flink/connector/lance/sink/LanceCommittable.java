@@ -29,24 +29,26 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * {@link LanceSinkWriter#prepareCommit()} 的产物，由 {@link LanceCommitter#commit} 消费。
+ * The product of {@link LanceSinkWriter#prepareCommit()}, consumed by {@link LanceCommitter#commit}.
  *
- * <p>Writer 侧不再承担任何「是否首次写入 / 是否建表 / 是否 Overwrite」的判定——Writer
- * 完全无状态，只负责把一批 {@link FragmentMetadata} 和建表所需的 Arrow Schema 打包；
- * 全部决策（dataset 是否已存在、首批走 Overwrite 还是 Append、Overwrite 模式下的清理）
- * 由 {@link LanceCommitter} 完成，因为 Committer 天然串行、无 subtask 并发冲突。
+ * <p>The writer no longer makes any "is this the first write / create the table / overwrite"
+ * decision — the writer is completely stateless and only packages a batch of
+ * {@link FragmentMetadata} together with the Arrow Schema needed to create the table; all
+ * decisions (whether the dataset already exists, whether the first batch goes through Overwrite or
+ * Append, and cleanup under Overwrite mode) are made by {@link LanceCommitter}, because the
+ * committer is naturally serial and free of subtask concurrency conflicts.
  *
- * <p>字段：
+ * <p>Fields:
  * <ul>
- *   <li>{@link #datasetPath} —— 目标 dataset 路径
- *   <li>{@link #arrowSchema} —— 建表用的 Arrow Schema（Overwrite / 首批 commit 时使用）
- *   <li>{@link #writeMode} —— 作业声明的写入模式（APPEND / OVERWRITE）
- *   <li>{@link #fragments} —— Writer 已写出的 Fragment 元数据列表
+ *   <li>{@link #datasetPath} — target dataset path
+ *   <li>{@link #arrowSchema} — Arrow Schema used to create the table (for Overwrite / first commit)
+ *   <li>{@link #writeMode} — the write mode declared by the job (APPEND / OVERWRITE)
+ *   <li>{@link #fragments} — the list of Fragment metadata already written by the writer
  * </ul>
  *
- * <p>{@link FragmentMetadata} 实现 {@code Serializable}；Arrow {@link
- * org.apache.arrow.vector.types.pojo.Schema} 不实现 {@code Serializable}，由
- * {@link LanceCommittableSerializer} 走 Arrow JSON 文本序列化。
+ * <p>{@link FragmentMetadata} implements {@code Serializable}; Arrow {@link
+ * org.apache.arrow.vector.types.pojo.Schema} does not implement {@code Serializable} and is
+ * serialized by {@link LanceCommittableSerializer} via Arrow JSON text.
  */
 public final class LanceCommittable implements Serializable {
 

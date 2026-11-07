@@ -23,15 +23,16 @@ import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.SinkV2Provider;
 
 /**
- * Flink 版本桥接：把 {@link LanceSink} 包装为 {@link DynamicTableSink.SinkRuntimeProvider}。
+ * Flink version bridge: wraps {@link LanceSink} as a
+ * {@link DynamicTableSink.SinkRuntimeProvider}.
  *
- * <p>本文件是「Flink 2.x 版本」：{@code LanceSink} 实现 Flink 2.1 的 2PC 组合接口
- * {@code Sink<RowData> + SupportsCommitter<LanceCommittable>}（FLIP-372 之后，
- * 旧的 {@code TwoPhaseCommittingSink} 组合接口已被拆分为更正交的两个 mixin），
- * 用 {@link SinkV2Provider#of(org.apache.flink.api.connector.sink2.Sink)} 包装。
+ * <p>This file is the "Flink 2.x version": {@code LanceSink} implements Flink 2.1's 2PC composite
+ * interface {@code Sink<RowData> + SupportsCommitter<LanceCommittable>} (after FLIP-372, the old
+ * {@code TwoPhaseCommittingSink} composite interface was split into two more orthogonal mixins),
+ * wrapped via {@link SinkV2Provider#of(org.apache.flink.api.connector.sink2.Sink)}.
  *
- * <p>这是对根 src 中同名类（1.x 版本）的覆盖；根 src 版本已通过 2.1 模块 pom 的
- * maven-compiler-plugin {@code <excludes>} 排除。
+ * <p>This overrides the same-named class in the root src (the 1.x version); the root-src version
+ * is excluded via maven-compiler-plugin {@code <excludes>} in the 2.1 module pom.
  */
 final class LanceSinkProviderBridge {
 

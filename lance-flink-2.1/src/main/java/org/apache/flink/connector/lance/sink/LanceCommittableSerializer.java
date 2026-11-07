@@ -34,35 +34,40 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * {@link LanceCommittable} 的序列化器。
+ * Serializer for {@link LanceCommittable}.
  *
- * <p>编码格式（version=3）：
+ * <p>Encoding format (version=3):
  * <pre>
  *   [datasetPath:utf]
  *   [writeMode:byte]                                  // 0 = APPEND, 1 = OVERWRITE
- *   [schemaJsonLen:int][schemaJson:bytes]             // Arrow Schema 的 JSON 表示（可能为空）
- *   [fragmentCount:int][fragment...]                  // 显式字段编码，见 {@link FragmentMetadataCodec}
+ *   [schemaJsonLen:int][schemaJson:bytes]             // JSON representation of the Arrow Schema (may be empty)
+ *   [fragmentCount:int][fragment...]                  // explicit field encoding, see {@link FragmentMetadataCodec}
  * </pre>
  *
- * <p>相比 version=2 的变化（issue #88 / M5）：fragment 段从「一次性 Java 原生序列化整个
- * 列表」改为 {@link FragmentMetadataCodec} 的显式字段编码，移除 {@code ObjectOutputStream}
- * 写入路径，消除原生反序列化的安全面与 serialVersionUID 脆弱性。
+ * <p>Changes from version=2 (issue #88 / M5): the fragment section changed from "serializing the
+ * entire list via Java native serialization in one shot" to explicit field encoding via
+ * {@link FragmentMetadataCodec}, removing the {@code ObjectOutputStream} write path and
+ * eliminating the native-deserialization attack surface and serialVersionUID fragility.
  *
- * <p>相比 version=1 的变化：删除了 {@code createDataset:bool}（Writer 侧的决策，B1 修复后由
- * Committer 承担），新增 {@code writeMode:byte} 让 Committer 知道作业声明的写入语义。
+ * <p>Changes from version=1: removed {@code createDataset:bool} (a writer-side decision that, after
+ * the B1 fix, is now handled by the Committer), and added {@code writeMode:byte} so the Committer
+ * knows the write semantics declared by the job.
  *
- * <p><b>向后兼容（R1 + #88）</b>：{@link #deserialize(int, byte[])} 保留 version=1 与 version=2
- * 的读路径。v1 把老格式的 {@code createDataset:bool} 映射为 {@link LanceOptions.WriteMode#OVERWRITE}
- * （true）或 {@link LanceOptions.WriteMode#APPEND}（false）——这是 B1 修复前的隐含语义：
- * createDataset=true 的 committable 走 Overwrite 建表、其它走 Append。v1/v2 的 fragment 段仍是
- * Java 原生序列化 blob，因此读路径保留 {@code ObjectInputStream}（仅用于历史兼容，新数据不再写
- * 该格式）。这样升级的作业可以**无缝读取**早期 alpha 构建里持久化在 checkpoint 中的 v1/v2 committable。
+ * <p><b>Backward compatibility (R1 + #88)</b>: {@link #deserialize(int, byte[])} retains read
+ * paths for version=1 and version=2. v1 maps the legacy {@code createDataset:bool} to
+ * {@link LanceOptions.WriteMode#OVERWRITE} (true) or {@link LanceOptions.WriteMode#APPEND} (false)
+ * — the implicit semantics before the B1 fix: a committable with createDataset=true creates the
+ * table via Overwrite, others use Append. The fragment section of v1/v2 is still a Java
+ * native-serialization blob, so the read path keeps {@code ObjectInputStream} (only for historical
+ * compatibility; new data no longer writes that format). This lets an upgraded job seamlessly read
+ * v1/v2 committables that were persisted in checkpoints by earlier alpha builds.
  *
- * <p>Arrow Schema 没有 {@code implements Serializable}，但提供了 {@code toJson()} 与
- * {@code Schema.fromJSON(String)} 的往返接口；使用 JSON 文本既简单又稳定。
+ * <p>Arrow Schema does not {@code implements Serializable}, but provides the round-trip API
+ * {@code toJson()} and {@code Schema.fromJSON(String)}; using JSON text is both simple and stable.
  *
- * <p>{@link FragmentMetadata} 及其嵌套类型虽然实现 {@code Serializable}，但这里不走 Java
- * 原生序列化，而用 {@link FragmentMetadataCodec} 的显式字段编码。
+ * <p>{@link FragmentMetadata} and its nested types do implement {@code Serializable}, but this class
+ * does not use Java native serialization; it uses {@link FragmentMetadataCodec}'s explicit field
+ * encoding instead.
  */
 public final class LanceCommittableSerializer
         implements SimpleVersionedSerializer<LanceCommittable> {
@@ -71,10 +76,10 @@ public final class LanceCommittableSerializer
 
     private static final int VERSION = 3;
 
-    /** 仍支持读取的历史版本号（写入端只用 {@link #VERSION}）。 */
+    /** Historical versions still supported for reading (the write side only uses {@link #VERSION}). */
     private static final int VERSION_V1 = 1;
 
-    /** version=2：fragment 段仍走 Java 原生序列化（M5 修复前的写入格式）。 */
+    /** version=2: the fragment section still uses Java native serialization (the pre-M5 write format). */
     private static final int VERSION_V2 = 2;
 
     private static final byte WRITE_MODE_APPEND = 0;
@@ -179,15 +184,16 @@ public final class LanceCommittableSerializer
     }
 
     /**
-     * 读取 version=1 的历史格式（B1 修复前写入的 committable）：
+     * Reads the legacy version=1 format (committables written before the B1 fix):
      * <pre>
      *   [datasetPath:utf]
-     *   [createDataset:bool]                              // v1 特有
+     *   [createDataset:bool]                              // v1-specific
      *   [schemaJsonLen:int][schemaJson:bytes]
      *   [fragmentCount:int][fragmentBlobLen:int][fragmentBlob:bytes]
      * </pre>
-     * 映射规则：{@code createDataset=true → WriteMode.OVERWRITE}；否则 APPEND。
-     * 这符合 v1 的隐含语义：createDataset=true 的 committable 由 Committer 走 Overwrite 建表。
+     * Mapping rule: {@code createDataset=true → WriteMode.OVERWRITE}; otherwise APPEND.
+     * This matches v1's implicit semantics: a committable with createDataset=true creates the table
+     * via Overwrite in the Committer.
      */
     @SuppressWarnings("unchecked")
     private LanceCommittable deserializeV1(byte[] serialized) throws IOException {

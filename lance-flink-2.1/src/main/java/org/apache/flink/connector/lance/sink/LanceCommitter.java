@@ -41,50 +41,59 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Lance {@link Committer}：把 {@link LanceCommittable} 中累积的 Fragment 元数据
- * 以一次事务提交到 Lance dataset。
+ * Lance {@link Committer} that commits the accumulated fragment metadata from
+ * {@link LanceCommittable} to a Lance dataset in a single transaction.
  *
- * <p>B1 修复后，Committer 承担 **提交决策** 但不承担 **目录物理清理**：
+ * <p>After the B1 fix, the committer owns the <b>commit decision</b> but not the
+ * <b>physical directory cleanup</b>:
  * <ul>
- *   <li>目录物理清理（OVERWRITE 模式下的 drop）由 Writer 侧 subtask 0 在
- *       {@code Fragment.write()} 之前完成——必须早于任何 fragment 落盘，否则
- *       commit 时 fragments 清单会指向被 drop 删掉的 .lance 文件；
- *   <li>Committer 的职责是基于 {@link Dataset#open(String)} 探测目标 dataset
- *       当前是否存在 manifest：不存在 → {@link Overwrite} + schema 建表并提交全部
- *       fragments；已存在 → 全部走 {@link Append}。
+ *   <li>The physical directory cleanup (the {@code drop} in OVERWRITE mode) is done
+ *       by subtask 0 on the writer side before {@code Fragment.write()} — it must
+ *       happen before any fragment is materialized, otherwise the fragment list at
+ *       commit time would point to {@code .lance} files already removed by the drop;
+ *   <li>The committer's job is to probe whether the target dataset currently has a
+ *       manifest via {@link Dataset#open(String)}: absent → {@link Overwrite} +
+ *       schema to create the table and commit all fragments; present → use
+ *       {@link Append} for everything.
  * </ul>
  *
- * <p>决策流程（按 datasetPath 独立判定）：
+ * <p>Decision flow (per datasetPath):
  * <ol>
- *   <li>遍历本批 CommitRequest，按 datasetPath 分桶聚合 fragments 与 schema；
- *   <li>对每个 bucket：探测 dataset 是否已 "可 open"，首次 commit 走 Overwrite，
- *       后续 commit 走 Append。</li>
+ *   <li>Iterate this batch of CommitRequests, bucketing fragments and schema by
+ *       datasetPath;
+ *   <li>For each bucket: probe whether the dataset is "openable"; the first commit
+ *       goes through Overwrite, later commits go through Append.</li>
  * </ol>
  *
- * <p>失败处理（R2 简化后的实际语义）：
+ * <p>Failure handling (actual semantics after the R2 simplification):
  * <ul>
- *   <li>Lance 底层 commit 抛出任何异常 → 按 {@link #MAX_RETRIES} 阈值分流：
- *       <code>req.getNumberOfRetries() &lt; MAX_RETRIES</code> → {@link CommitRequest#retryLater()}；
- *       否则 {@link CommitRequest#signalFailedWithKnownReason(Throwable)}。</li>
- *   <li>bucket 的 schema 缺失（需建表却没有任何 committable 携带 schema）
- *       → 直接 {@link CommitRequest#signalFailedWithKnownReason(Throwable)}，不重试
- *       （这是作业配置错误，重试也解决不了）。</li>
+ *   <li>Any exception thrown by the underlying Lance commit → split by the
+ *       {@link #MAX_RETRIES} threshold:
+ *       <code>req.getNumberOfRetries() &lt; MAX_RETRIES</code> → {@link CommitRequest#retryLater()};
+ *       otherwise {@link CommitRequest#signalFailedWithKnownReason(Throwable)}.</li>
+ *   <li>Missing schema in a bucket (needs to create the table but no committable
+ *       carries a schema) → {@link CommitRequest#signalFailedWithKnownReason(Throwable)}
+ *       directly, without retry (this is a job configuration error that retrying
+ *       cannot fix).</li>
  * </ul>
  *
- * <p>本实现存意不区分 known / unknown reason：走 object_store 的 Lance JNI 既会把
- * 底层 S3 / HDFS / local-FS 的异常包装成 {@link RuntimeException}，也会把乐观并发冲突包
- * 装成同类型，在 Java 端无法稳定区分；统一走 known reason 签名更安全。
+ * <p>This implementation deliberately does not distinguish known vs unknown reasons:
+ * the Lance JNI backed by object_store wraps both underlying S3 / HDFS / local-FS
+ * errors and optimistic concurrency conflicts into the same {@link RuntimeException},
+ * which cannot be reliably distinguished on the Java side; consistently using the
+ * known-reason signature is safer.
  */
 public class LanceCommitter implements Committer<LanceCommittable> {
 
     private static final Logger LOG = LoggerFactory.getLogger(LanceCommitter.class);
 
     /**
-     * 单条 CommitRequest 的最大重试次数，超过后转为 signalFailed。
-     * Lance 乐观并发写冲突若反复失败，极可能是上游数据或 schema 不兼容，无限 retry
-     * 只会让 Flink job 卡住。
+     * Maximum number of retries for a single CommitRequest, after which it becomes
+     * signalFailed. If Lance optimistic concurrency write conflicts keep failing,
+     * the upstream data or schema is very likely incompatible; retrying forever only
+     * wedges the Flink job.
      *
-     * <p>protected 是为了在单元测试里调小这个值、暴露边界行为。
+     * <p>protected so unit tests can lower this value to expose boundary behavior.
      */
     protected int maxRetries() {
         return MAX_RETRIES;
@@ -105,7 +114,7 @@ public class LanceCommitter implements Committer<LanceCommittable> {
             return;
         }
 
-        // 1) 按 datasetPath 分桶（支持极少见的"一次 commit 批次跨多表"情况）
+        // 1) Bucket by datasetPath (supports the rare "one commit batch spans multiple tables" case)
         Map<String, PathBucket> buckets = new LinkedHashMap<>();
         for (CommitRequest<LanceCommittable> req : requests) {
             LanceCommittable c = req.getCommittable();
@@ -116,20 +125,20 @@ public class LanceCommitter implements Committer<LanceCommittable> {
                     .add(req, c);
         }
 
-        // 2) 按桶独立提交；某桶失败不影响其它桶
+        // 2) Commit each bucket independently; one bucket failing does not affect others
         for (PathBucket bucket : buckets.values()) {
             commitBucket(bucket);
         }
     }
 
-    /** 对单个 datasetPath 的所有 CommitRequest 聚合提交，并通过 CommitRequest API 回报结果。 */
+    /** Aggregates and commits all CommitRequests for a single datasetPath, reporting results via the CommitRequest API. */
     private void commitBucket(PathBucket bucket) {
         String path = bucket.datasetPath;
         try {
             boolean datasetExists = datasetExists(path);
 
             if (!datasetExists) {
-                // 首次建表：Overwrite + schema + 全部 fragments
+                // First commit: Overwrite + schema + all fragments
                 if (bucket.schema == null) {
                     IOException err =
                             new IOException(
@@ -150,7 +159,7 @@ public class LanceCommitter implements Committer<LanceCommittable> {
                         path,
                         bucket.allFragments().size());
             } else {
-                // 已存在：全部 Append
+                // Already exists: Append everything
                 Operation op = Append.builder().fragments(bucket.allFragments()).build();
                 executeTransaction(path, op);
                 LOG.info(
@@ -158,50 +167,54 @@ public class LanceCommitter implements Committer<LanceCommittable> {
                         path,
                         bucket.allFragments().size());
             }
-            // 整桶 commit 成功：所有 request 隐式成功，runtime 不再回放它们
+            // Whole bucket committed successfully: all requests succeed implicitly and the runtime won't replay them
         } catch (Throwable t) {
-            // 乐观并发冲突 / Lance 侧的其它可恢复错误：让 runtime 下个 checkpoint 周期再试
+            // Optimistic concurrency conflict / other recoverable errors on the Lance side: let the runtime retry on the next checkpoint cycle
             LOG.warn("Lance commit failed on {}, deciding retry vs fail per request", path, t);
             retryOrFail(bucket, t);
         }
     }
 
     /**
-     * 判定目标 dataset 是否已存在；不存在用 Lance 的异常来识别。
+     * Determines whether the target dataset already exists; absence is detected via
+     * the exception thrown by Lance.
      *
-     * <p>protected 是为了让单元测试可以注入停饱行为（R2 测试点）。
+     * <p>protected so unit tests can inject stub behavior (R2 test point).
      */
     protected boolean datasetExists(String path) {
         try (Dataset ignored = Dataset.open(path, allocator)) {
             return true;
         } catch (Throwable t) {
-            // Lance Java API 在 "manifest 不存在" / "路径不存在" 等情况下均抛 RuntimeException；
-            // 这里统一视为"不存在"。真正的 IO 异常会在下一步的 commit 阶段再暴露并走重试路径。
+            // The Lance Java API throws RuntimeException for both "manifest missing" and
+            // "path missing"; treat both as "does not exist" here. Real IO errors surface
+            // in the next commit step and take the retry path.
             LOG.debug("Dataset.open({}) failed, treating as non-existent: {}", path, t.toString());
             return false;
         }
     }
 
     /**
-     * 执行一次 Lance 事务。
+     * Executes a single Lance transaction.
      *
-     * <p>protected 是为了让单元测试可以注入模拟失败（R2 测试点）——而实际
-     * 冲突很难在不起 Lance JNI handle 的情况下造出来。
+     * <p>protected so unit tests can inject simulated failures (R2 test point) —
+     * real conflicts are hard to reproduce without spinning up a Lance JNI handle.
      */
     protected void executeTransaction(String path, Operation op) throws IOException {
         CommitBuilder builder = new CommitBuilder(path, allocator);
         try (Transaction txn = new Transaction.Builder().operation(op).build();
              Dataset ignored = builder.execute(txn)) {
-            // Dataset.execute 的返回值是本次提交后的新 Dataset 句柄；立刻关闭即可
+            // Dataset.execute returns the new Dataset handle after this commit; close it immediately
         } catch (Exception e) {
             throw new IOException("Lance commit failed on " + path, e);
         }
     }
 
     /**
-     * 把 bucket 内所有 request 按重试次数阈值分流为 retryLater / signalFailed。
-     * 并非依赖异常类型——因为走 object_store 的 Lance JNI 会把连接失败 /
-     * 权限失败 / 乐观并发冲突均包装成 {@link RuntimeException}，在 Java 端难以区分。
+     * Splits all requests in the bucket into retryLater / signalFailed by the retry
+     * count threshold. It does not rely on exception type — the Lance JNI backed by
+     * object_store wraps connection failures / permission failures / optimistic
+     * concurrency conflicts into the same {@link RuntimeException}, which is hard to
+     * distinguish on the Java side.
      */
     private void retryOrFail(PathBucket bucket, Throwable err) {
         for (CommitRequest<LanceCommittable> req : bucket.requests) {
@@ -230,10 +243,10 @@ public class LanceCommitter implements Committer<LanceCommittable> {
         }
     }
 
-    /** 单条 datasetPath 的 commit 聚合桶。 */
+    /** Commit aggregation bucket for a single datasetPath. */
     private static final class PathBucket {
         final String datasetPath;
-        final Schema schema; // 首个带 schema 的 committable 的 schema，用于潜在建表
+        final Schema schema; // schema from the first schema-carrying committable, used for potential table creation
         final List<CommitRequest<LanceCommittable>> requests = new ArrayList<>();
         final List<FragmentMetadata> fragments = new ArrayList<>();
 

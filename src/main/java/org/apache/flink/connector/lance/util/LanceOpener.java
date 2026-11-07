@@ -64,17 +64,19 @@ public final class LanceOpener {
     /**
      * Open a dataset honoring the time-travel options declared in {@code options}.
      *
-     * @param flinkConf Flink 运行时配置，用于把 {@code flink.hadoop.*}（如
-     *                  {@code flink.hadoop.tbdsfs.meta}）注入 Hadoop {@code Configuration}，
-     *                  使 tbdsfs/hdfs 等 Hadoop 兼容 FileSystem 能正确初始化。可为 {@code null}。
+     * @param flinkConf Flink runtime configuration used to inject {@code flink.hadoop.*} (such as
+     *                  {@code flink.hadoop.tbdsfs.meta}) into the Hadoop {@code Configuration},
+     *                  so that Hadoop-compatible filesystems like tbdsfs/hdfs can initialize
+     *                  correctly. May be {@code null}.
      */
     public static Dataset open(String datasetPath, BufferAllocator allocator, LanceOptions options,
                                org.apache.flink.configuration.Configuration flinkConf) {
-        // 方案 B：对 tbdsfs/hdfs 等 Hadoop 兼容 scheme，先通过 Hadoop FileSystem 缓存到本地
+        // Plan B: for Hadoop-compatible schemes such as tbdsfs/hdfs, first cache to a local
+        // directory via the Hadoop FileSystem.
         org.apache.hadoop.conf.Configuration hadoopConf =
                 LanceHadoopPathResolver.buildHadoopConfigurationFromFlink(flinkConf);
-        // 注入表 DDL WITH 里 hadoop.* 前缀的配置（如 tbdsfs.meta），优先级最高，
-        // 用于绕过集群部分节点 core-site.xml 缺配置的问题。
+        // Inject hadoop.*-prefixed configs from the table DDL WITH clause (such as tbdsfs.meta)
+        // at the highest priority, to work around missing core-site.xml on some cluster nodes.
         if (options != null && options.getHadoopConfig() != null) {
             for (java.util.Map.Entry<String, String> e : options.getHadoopConfig().entrySet()) {
                 hadoopConf.set(e.getKey(), e.getValue());

@@ -37,16 +37,18 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * Lance 主键 upsert 数据汇（Flink 2.x Sink V2 版本）。
+ * Lance primary-key upsert sink (Flink 2.x Sink V2 version).
  *
- * <p>对应 issue #90 的方案 A：{@link Sink} + {@link SupportsCommitter} 组合，writer 无状态
- * 缓冲按 {@code RowKind} 分类的行数据，串行 {@link LanceUpsertCommitter} 统一执行
- * {@code Dataset.mergeInsert} 完成 {@code +I/+U/-D} 语义。
+ * <p>Corresponds to plan A of issue #90: a {@link Sink} + {@link SupportsCommitter} combination.
+ * The writer buffers rows classified by {@code RowKind} in a stateless manner, and the serial
+ * {@link LanceUpsertCommitter} performs {@code Dataset.mergeInsert} to realize the
+ * {@code +I/+U/-D} semantics.
  *
- * <p>与 append 路径 {@link LanceSink} 的结构完全平行，差异在于：
+ * <p>The structure is fully parallel to the append path {@link LanceSink}, differing in that:
  * <ul>
- *   <li>writer 产出 {@link LanceUpsertCommittable}（携带序列化行数据），而非 fragment 元数据；</li>
- *   <li>committer 串行调用 {@code mergeInsert}，而非 {@code Append}/{@code Overwrite}。</li>
+ *   <li>the writer produces {@link LanceUpsertCommittable} (carrying serialized row data) rather
+ *       than fragment metadata;</li>
+ *   <li>the committer serially calls {@code mergeInsert} rather than {@code Append}/{@code Overwrite}.</li>
  * </ul>
  */
 public class LanceUpsertSink implements Sink<RowData>, SupportsCommitter<LanceUpsertCommittable> {

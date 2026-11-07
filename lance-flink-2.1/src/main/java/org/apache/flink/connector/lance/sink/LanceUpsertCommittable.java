@@ -29,23 +29,26 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * {@link LanceUpsertWriter#prepareCommit()} 的产物，由 {@link LanceUpsertCommitter#commit} 消费。
+ * The product of {@link LanceUpsertWriter#prepareCommit()}, consumed by
+ * {@link LanceUpsertCommitter#commit}.
  *
- * <p>与 append 路径的 {@link LanceCommittable} 不同：{@code Dataset.mergeInsert} 消费的是
- * <b>行数据</b>（{@code ArrowArrayStream}）而非 fragment 元数据，因此本类携带的是 Arrow IPC
- * stream 序列化后的两批行数据：
+ * <p>Unlike the append-path {@link LanceCommittable}: {@code Dataset.mergeInsert} consumes
+ * <b>row data</b> ({@code ArrowArrayStream}) rather than fragment metadata, so this class carries
+ * two batches of row data serialized as Arrow IPC streams:
  *
  * <ul>
- *   <li>{@link #upsertBatch} —— {@code +I/+U} 行（Arrow IPC bytes），committer 走
- *       {@code mergeInsert(UpdateAll + InsertAll)}；</li>
- *   <li>{@link #deleteBatch} —— {@code -D} 行（Arrow IPC bytes），committer 走
- *       {@code mergeInsert(Delete + DoNothing)}。</li>
+ *   <li>{@link #upsertBatch} — {@code +I/+U} rows (Arrow IPC bytes), the committer runs
+ *       {@code mergeInsert(UpdateAll + InsertAll)};</li>
+ *   <li>{@link #deleteBatch} — {@code -D} rows (Arrow IPC bytes), the committer runs
+ *       {@code mergeInsert(Delete + DoNothing)}.</li>
  * </ul>
  *
- * <p>两批必须分开序列化，因为单个 {@code mergeInsert} 只能设一种 {@code WhenMatched}
- * 行为（PoC 已实证：{@code WhenMatched} 是单一枚举，无法在一次调用内混合 update 与 delete）。
+ * <p>The two batches must be serialized separately, because a single {@code mergeInsert} can set
+ * only one {@code WhenMatched} behavior (empirically confirmed by the PoC: {@code WhenMatched} is
+ * a single enum, so update and delete cannot be mixed in one call).
  *
- * <p>{@code UPDATE_BEFORE} 在 writer 侧即被丢弃（upsert 不需要旧值），不会进入任何一批。
+ * <p>{@code UPDATE_BEFORE} is dropped on the writer side (upsert does not need the old value) and
+ * never enters either batch.
  */
 public final class LanceUpsertCommittable implements Serializable {
 

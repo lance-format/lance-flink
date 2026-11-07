@@ -40,23 +40,25 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Lance 的 keyed upsert {@link CommittingSinkWriter}（Flink 2.1 2PC Writer 契约）。
+ * Lance's keyed upsert {@link CommittingSinkWriter} (Flink 2.1 two-phase-commit writer contract).
  *
- * <p>与 append 路径的 {@link LanceSinkWriter}（物化 fragment）不同，本 writer 把
- * {@link RowData} 按 {@link RowKind} 分成两批，在 {@link #prepareCommit()} 时用
- * Arrow IPC stream 序列化（{@link ArrowIpcCodec}）后打包进 {@link LanceUpsertCommittable}，
- * 由 {@link LanceUpsertCommitter} 统一执行 {@code Dataset.mergeInsert}。
+ * <p>Unlike the append path's {@link LanceSinkWriter} (which materializes fragments), this
+ * writer splits {@link RowData} into two batches by {@link RowKind}, serializes them via the
+ * Arrow IPC stream ({@link ArrowIpcCodec}) in {@link #prepareCommit()}, and packs them into
+ * {@link LanceUpsertCommittable} for {@link LanceUpsertCommitter} to apply
+ * {@code Dataset.mergeInsert}.
  *
- * <p>RowKind 处理：
+ * <p>RowKind handling:
  * <ul>
  *   <li>{@code INSERT}/{@code UPDATE_AFTER} → {@code upsertBatch}（UpdateAll + InsertAll）；</li>
  *   <li>{@code DELETE} → {@code deleteBatch}（Delete + DoNothing）；</li>
- *   <li>{@code UPDATE_BEFORE} → 丢弃（upsert 不需要旧值）。</li>
+ *   <li>{@code UPDATE_BEFORE} → discarded (upsert does not need the old value).</li>
  * </ul>
  *
- * <p>Writer 无状态：行只缓冲在内存，checkpoint 时随 committable 进入 checkpoint 状态，
- * commit 成功后 runtime 不再回放；失败则回放 committable 重试，得益于
- * {@code mergeInsert} 的幂等性，Exactly-Once 成立。
+ * <p>The writer is stateless: rows are only buffered in memory and enter checkpoint state with
+ * the committable; after a successful commit the runtime stops replaying, and on failure it
+ * replays the committable to retry. Thanks to the idempotency of {@code mergeInsert},
+ * exactly-once holds.
  */
 public class LanceUpsertWriter
         implements CommittingSinkWriter<RowData, LanceUpsertCommittable> {
@@ -124,7 +126,7 @@ public class LanceUpsertWriter
 
     @Override
     public void flush(boolean endOfInput) throws IOException, InterruptedException {
-        // 无状态：行保留在 buffer，prepareCommit 时序列化；flush 无需动作。
+        // Stateless: rows stay in the buffer, serialized in prepareCommit; flush is a no-op.
     }
 
     @Override
@@ -162,7 +164,7 @@ public class LanceUpsertWriter
     }
 
     /**
-     * 把一批 RowData 转成 VectorSchemaRoot 并序列化为 Arrow IPC stream 字节。
+     * Converts a batch of RowData into a VectorSchemaRoot and serializes it into Arrow IPC stream bytes.
      */
     private byte[] serializeBatch(List<RowData> rows) throws IOException {
         if (rows.isEmpty()) {

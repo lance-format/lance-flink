@@ -20,14 +20,14 @@
     </properties>
 
     <dependencies>
-        <!-- Lance 依赖 -->
+        <!-- Lance dependencies -->
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-core</artifactId>
         </dependency>
 
-        <!-- Lance Namespace：可插拔 Catalog 后端契约，及 OpenAPI 生成的
-             模型类（DescribeTableResponse / CreateTableRequest 等） -->
+        <!-- Lance Namespace: pluggable catalog backend contract, plus OpenAPI-generated
+             model classes (DescribeTableResponse / CreateTableRequest, etc.) -->
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
@@ -80,8 +80,9 @@
             <artifactId>flink-connector-base</artifactId>
         </dependency>
 
-        <!-- Hadoop（用于 tbdsfs / hdfs 等 Hadoop 兼容 FileSystem 前置缓存下载；
-             运行时由集群提供，因此 scope=provided 不打进 fat jar） -->
+        <!-- Hadoop (for the front cache download of Hadoop-compatible FileSystems such as
+             tbdsfs / hdfs; provided by the cluster at runtime, so scope=provided keeps it out
+             of the fat jar) -->
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
@@ -103,13 +104,13 @@
             </exclusions>
         </dependency>
 
-        <!-- 日志 -->
+        <!-- Logging -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
 
-        <!-- 测试依赖 -->
+        <!-- Test dependencies -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
@@ -185,7 +186,7 @@
 
     <build>
         <plugins>
-            <!-- 引用共享源码 -->
+            <!-- Reference shared source -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
