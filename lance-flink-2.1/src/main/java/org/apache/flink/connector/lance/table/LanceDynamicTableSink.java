@@ -19,9 +19,11 @@
 package org.apache.flink.connector.lance.table;
 
 import org.apache.flink.connector.lance.LanceSink;
+import org.apache.flink.connector.lance.LanceUpsertSink;
 import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
+import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
@@ -33,13 +35,9 @@ import java.util.List;
 /**
  * Flink 2.x 下的 {@link LanceDynamicTableSink} 实现。
  *
- * <p>当前只支持 append-only 场景（无主键）。上游 PR#76 带入的 primary-key upsert
- * 分支因依赖 Flink 1.x 的 {@code DataStreamSinkProvider.consumeDataStream} +
- * {@code DataStream.addSink(SinkFunction)}（在 Flink 2.x 全部被移除），
- * 暂不在 Flink 2.1 下可用；配置了 primary key 的建表语句会在 runtime 直接报错。
- *
- * <p>Follow-up：把 {@code LanceUpsertSink} 迁移到 Sink V2 +
- * {@code SupportsCommitter}（keyed 版本），然后恢复对 upsert 分支的支持。
+ * <p>无主键 → append-only（{@link LanceSink}）；有主键 → 主键 upsert
+ * （{@link LanceUpsertSink}，Sink V2 + {@code SupportsCommitter}，issue #90 方案 A）。
+ * 两条路径共用同一 {@code LanceDynamicTableSink}，由 {@code primaryKeys} 是否为空切换。
  */
 public class LanceDynamicTableSink implements DynamicTableSink {
 
@@ -66,9 +64,7 @@ public class LanceDynamicTableSink implements DynamicTableSink {
         if (primaryKeys.isEmpty()) {
             return ChangelogMode.newBuilder().addContainedKind(RowKind.INSERT).build();
         }
-        // 上游 PR#76 的 upsert 分支在 Flink 2.1 下尚未实现 Sink V2 版本；
-        // 返回声明仅为了让 planner 可以继续规划作业；真正写入时会在
-        // getSinkRuntimeProvider 阶段抛错。
+        // 主键 upsert 支持 +I/+U/-D（-U 即 UPDATE_BEFORE 由 writer 侧丢弃）。
         return ChangelogMode.newBuilder()
                 .addContainedKind(RowKind.INSERT)
                 .addContainedKind(RowKind.UPDATE_AFTER)
@@ -78,13 +74,11 @@ public class LanceDynamicTableSink implements DynamicTableSink {
 
     @Override
     public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
-        if (!primaryKeys.isEmpty()) {
-            throw new UnsupportedOperationException(
-                    "Lance primary-key upsert sink is not yet available on Flink 2.x. "
-                            + "The feature exists on the Flink 1.20 build; see follow-up issue. "
-                            + "Workaround: drop the PRIMARY KEY constraint for append-only writes.");
-        }
         RowType rowType = (RowType) physicalDataType.getLogicalType();
+        if (!primaryKeys.isEmpty()) {
+            LanceUpsertSink upsertSink = new LanceUpsertSink(options, rowType, primaryKeys);
+            return SinkV2Provider.of(upsertSink);
+        }
         LanceSink lanceSink = new LanceSink(options, rowType);
         return LanceSinkProviderBridge.toProvider(lanceSink);
     }
