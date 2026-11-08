@@ -33,11 +33,12 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Flink 2.x 下的 {@link LanceDynamicTableSink} 实现。
+ * {@link LanceDynamicTableSink} implementation for Flink 2.x.
  *
- * <p>无主键 → append-only（{@link LanceSink}）；有主键 → 主键 upsert
- * （{@link LanceUpsertSink}，Sink V2 + {@code SupportsCommitter}，issue #90 方案 A）。
- * 两条路径共用同一 {@code LanceDynamicTableSink}，由 {@code primaryKeys} 是否为空切换。
+ * <p>No primary key → append-only ({@link LanceSink}); with primary key → primary-key upsert
+ * ({@link LanceUpsertSink}, Sink V2 + {@code SupportsCommitter}, issue #90 plan A).
+ * Both paths share the same {@code LanceDynamicTableSink}, switching on whether
+ * {@code primaryKeys} is empty.
  */
 public class LanceDynamicTableSink implements DynamicTableSink {
 
@@ -64,7 +65,7 @@ public class LanceDynamicTableSink implements DynamicTableSink {
         if (primaryKeys.isEmpty()) {
             return ChangelogMode.newBuilder().addContainedKind(RowKind.INSERT).build();
         }
-        // 主键 upsert 支持 +I/+U/-D（-U 即 UPDATE_BEFORE 由 writer 侧丢弃）。
+        // Primary-key upsert supports +I/+U/-D (-U i.e. UPDATE_BEFORE is dropped on the writer side).
         return ChangelogMode.newBuilder()
                 .addContainedKind(RowKind.INSERT)
                 .addContainedKind(RowKind.UPDATE_AFTER)
@@ -90,8 +91,8 @@ public class LanceDynamicTableSink implements DynamicTableSink {
 
     @Override
     public String asSummaryString() {
-        // 刻意与根 src 版本（Flink 1.x）保持一致："Lance Table Sink"。
-        // 若未来需要在 EXPLAIN 输出里区分版本，应在根 src 和 2.1 版同步修改。
+        // Deliberately kept consistent with the root src version (Flink 1.x): "Lance Table Sink".
+        // If version differentiation is ever needed in EXPLAIN output, change both root src and 2.1.
         return "Lance Table Sink";
     }
 

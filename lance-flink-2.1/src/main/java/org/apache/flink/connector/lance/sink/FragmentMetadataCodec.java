@@ -33,21 +33,26 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * {@link FragmentMetadata} 列表的显式字段编解码器（issue #88 / round-2 M5）。
+ * Explicit field codec for a list of {@link FragmentMetadata} (issue #88 / round-2 M5).
  *
- * <p>取代 {@link LanceCommittableSerializer} 里对 {@code List<FragmentMetadata>} 的 Java 原生序列化
- * （{@code ObjectOutputStream} / {@code ObjectInputStream}）。原生序列化有两个问题：
+ * <p>Replaces the Java native serialization of {@code List<FragmentMetadata>} in
+ * {@link LanceCommittableSerializer} ({@code ObjectOutputStream} / {@code ObjectInputStream}).
+ * Native serialization has two problems:
  * <ol>
- *   <li><b>安全</b>：{@code ObjectInputStream.readObject()} 是已知高危反序列化面；
- *   <li><b>向前兼容脆弱</b>：{@code FragmentMetadata} 私有字段的任何重排/改名都会改变
- *       serialVersionUID，旧 checkpoint 无法恢复且没有逃生通道。
+ *   <li><b>Security</b>: {@code ObjectInputStream.readObject()} is a known high-risk
+ *       deserialization surface;
+ *   <li><b>Fragile forward compatibility</b>: any reordering/renaming of {@code FragmentMetadata}'s
+ *       private fields changes its serialVersionUID, making old checkpoints unrecoverable with no
+ *       escape hatch.
  * </ol>
  *
- * <p>本类把所有字段（含 nullable 与 {@link Optional} 字段）逐一手工编码成稳定的二进制布局，
- * 不依赖类的 {@code serialVersionUID}。布局与 Lance 7.0.0 的 getter/构造签名对齐；若未来 Lance
- * 升级改变字段，这里会以显式、可追踪的方式编译失败（而非运行时静默 {@code InvalidClassException}）。
+ * <p>This class encodes every field (including nullable and {@link Optional} fields) one by one into
+ * a stable binary layout, independent of the class's {@code serialVersionUID}. The layout is
+ * aligned with Lance 7.0.0's getter/constructor signatures; if a future Lance upgrade changes a
+ * field, this code fails to compile in an explicit, trackable way (rather than silently throwing
+ * {@code InvalidClassException} at runtime).
  *
- * <p>编码布局（v3 committable 的 fragment 段）：
+ * <p>Encoding layout (the fragment section of a v3 committable):
  * <pre>
  *   [fragmentCount:int]
  *   for each FragmentMetadata:
@@ -78,7 +83,7 @@ public final class FragmentMetadataCodec {
 
     private FragmentMetadataCodec() {}
 
-    /** 写 fragment 数量 + 每个 fragment。 */
+    /** Writes the fragment count + each fragment. */
     public static void writeFragments(DataOutputStream out, List<FragmentMetadata> fragments)
             throws IOException {
         out.writeInt(fragments.size());
@@ -87,7 +92,7 @@ public final class FragmentMetadataCodec {
         }
     }
 
-    /** 读 fragment 数量 + 每个 fragment。 */
+    /** Reads the fragment count + each fragment. */
     public static List<FragmentMetadata> readFragments(DataInputStream in) throws IOException {
         int count = in.readInt();
         List<FragmentMetadata> fragments = new ArrayList<>(count);
@@ -163,7 +168,8 @@ public final class FragmentMetadataCodec {
             lastUpdated = new VersionMeta(in.readUTF());
         }
 
-        // 7 参构造覆盖全部字段；physicalRows 的 boxed 参数与 getter 的 primitive long 等价。
+        // The 7-arg constructor covers all fields; the boxed physicalRows argument is equivalent
+        // to the getter's primitive long.
         return new FragmentMetadata(
                 id,
                 files,

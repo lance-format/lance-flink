@@ -36,51 +36,55 @@ import org.apache.flink.table.types.logical.RowType;
 import java.io.IOException;
 
 /**
- * Lance 数据汇（Flink 2.x 版本）。
+ * Lance sink (Flink 2.x version).
  *
- * <p>Flink 2.1 已经移除了 {@code TwoPhaseCommittingSink} 的组合接口，改为通过
- * 更正交的 {@link Sink} + {@link SupportsCommitter} 两个 mixin 来声明 2PC Sink。
- * 本类同时实现两个接口：
+ * <p>Flink 2.1 has removed the combined {@code TwoPhaseCommittingSink} interface and instead
+ * declares a two-phase-commit sink through the more orthogonal {@link Sink} +
+ * {@link SupportsCommitter} mixins. This class implements both interfaces:
  * <ul>
- *   <li>{@link Sink#createWriter(WriterInitContext)} 返回
- *       {@link org.apache.flink.api.connector.sink2.CommittingSinkWriter}（{@link LanceSinkWriter}），
- *       负责预提交——把 RowData 攒批写成 Lance Fragment 数据文件；
- *   <li>{@link SupportsCommitter#createCommitter(CommitterInitContext)} 返回
- *       {@link LanceCommitter}，负责把 fragments 以单次 Lance Transaction 提交。
- *   <li>{@link SupportsCommitter#getCommittableSerializer()} 返回 committable 的网络传输/状态序列化器。
+ *   <li>{@link Sink#createWriter(WriterInitContext)} returns a
+ *       {@link org.apache.flink.api.connector.sink2.CommittingSinkWriter} ({@link LanceSinkWriter})
+ *       that pre-commits by batching RowData into Lance fragment data files;
+ *   <li>{@link SupportsCommitter#createCommitter(CommitterInitContext)} returns
+ *       {@link LanceCommitter}, which commits the fragments in a single Lance transaction.
+ *   <li>{@link SupportsCommitter#getCommittableSerializer()} returns the committable's
+ *       network/state serializer.
  * </ul>
  *
- * <p>Exactly-Once 的来源：Flink 的 checkpoint barrier 触发 writer {@code flush(false)} → 产生
- * committable，runtime 将 committable 写入 checkpoint；checkpoint 成功之后 runtime 把 committable
- * 发给 committer，由 committer 调用 Lance 的 {@code CommitBuilder.execute(Transaction)} 真正提交。
- * 任何环节失败 runtime 会回放 committable 重试，直到 commit 成功——得益于 Lance 的乐观并发控制，
- * 该协议天然 Exactly-Once。
+ * <p>Exactly-once provenance: Flink's checkpoint barrier triggers the writer {@code flush(false)},
+ * which produces a committable; the runtime writes the committable into the checkpoint; after the
+ * checkpoint succeeds the runtime delivers the committable to the committer, which calls Lance's
+ * {@code CommitBuilder.execute(Transaction)} to actually commit. If any step fails the runtime
+ * replays the committable and retries until commit succeeds — thanks to Lance's optimistic
+ * concurrency control, the protocol is naturally exactly-once.
  *
- * <p>构造函数与 Builder 签名与旧 1.x {@code RichSinkFunction} 版本保持一致，
- * 使上层共享源码（如 {@code LanceDynamicTableSink}）无需感知版本差异。
+ * <p>The constructor and builder signatures are kept consistent with the old 1.x
+ * {@code RichSinkFunction} version so that shared upper-layer code (e.g.
+ * {@code LanceDynamicTableSink}) need not be aware of version differences.
  *
- * <p><b>⚠️ 已知局限（R3）— OVERWRITE 与并行度 &gt; 1</b>：
- * {@link LanceOptions.WriteMode#OVERWRITE} 下的"预清理"动作目前由
- * {@link LanceSinkWriter} 的 subtask 0 在 {@code Fragment.write()} 之前
- * 调用 {@code Dataset.drop(path)} 完成。这一调用必须发生在任何 subtask
- * 的首次 {@code Fragment.write()} 之前，否则 fragments 清单会指向被
- * drop 删掉的 {@code .lance} 文件。
+ * <p><b>⚠️ Known limitation (R3) — OVERWRITE with parallelism &gt; 1</b>:
+ * Under {@link LanceOptions.WriteMode#OVERWRITE}, the "pre-cleanup" action is currently performed
+ * by subtask 0 of {@link LanceSinkWriter}, which calls {@code Dataset.drop(path)} before
+ * {@code Fragment.write()}. This call must happen before any subtask's first
+ * {@code Fragment.write()}, otherwise the fragment list would point to {@code .lance} files that
+ * the drop has deleted.
  *
- * <p>Flink 保证了 **同一个 subtask** 内构造与 write 的顺序串行化（Mailbox），
- * 但 **不同 subtask** 之间没有 barrier。真实集群启动时序偏斜的情况下，
- * subtask-N (N &gt; 0) 可能在 subtask 0 的 drop 完成之前就开始 {@code Fragment.write()}；
- * 此时它刚物化的 {@code .lance} 文件会被 subtask 0 的 drop 一并删掉，
- * 导致当前 checkpoint 窗口的部分数据丢失（下一个 checkpoint 窗口已经干净，不受影响）。
+ * <p>Flink guarantees construction and write ordering within **the same subtask** (via the
+ * mailbox), but there is no barrier across **different subtasks**. Under skewed startup timing on
+ * a real cluster, subtask-N (N &gt; 0) may start {@code Fragment.write()} before subtask 0's drop
+ * completes; the {@code .lance} file it just materialized would then be deleted by subtask 0's
+ * drop, losing part of the current checkpoint window's data (the next checkpoint window is already
+ * clean and unaffected).
  *
- * <p><b>缓解措施</b>（取其一）：
+ * <p><b>Mitigations</b> (choose one):
  * <ul>
- *   <li><b>推荐</b>：对 OVERWRITE 作业显式设置 {@code sink.parallelism = 1}，
- *       Flink SQL 侧通过 {@code 'sink.parallelism' = '1'} 表选项、
- *       DataStream 侧通过 {@code dataStream.sinkTo(sink).setParallelism(1)}；</li>
- *   <li>或在作业编排侧"先跑一个 parallelism=1 的 OVERWRITE truncate 作业，
- *       然后再启动真正的 parallelism=N 的 APPEND 作业"；</li>
- *   <li>追踪：后续版本将把 OVERWRITE 预清理迁到 Committer 侧的 staging-path
- *       commit-rename 模型，消除此竞态。</li>
+ *   <li><b>Recommended</b>: set {@code sink.parallelism = 1} explicitly for OVERWRITE jobs — via
+ *       the {@code 'sink.parallelism' = '1'} table option on the Flink SQL side, or
+ *       {@code dataStream.sinkTo(sink).setParallelism(1)} on the DataStream side;</li>
+ *   <li>or orchestrate a "parallelism=1 OVERWRITE truncate job first, then start the real
+ *       parallelism=N APPEND job";</li>
+ *   <li>Tracking: a future version will move OVERWRITE pre-cleanup to a staging-path
+ *       commit-rename model on the committer side to eliminate this race.</li>
  * </ul>
  */
 public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommittable> {
@@ -96,7 +100,7 @@ public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommitta
     }
 
     // ------------------------------------------------------------------------
-    // Sink V2 核心方法
+    // Sink V2 core methods
     // ------------------------------------------------------------------------
 
     @Override
@@ -117,7 +121,8 @@ public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommitta
     }
 
     // ------------------------------------------------------------------------
-    // 向后兼容的只读访问器（保持与旧实现签名一致，供上层 LanceDynamicTableSink 等复用）
+    // Backward-compatible read-only accessors (signatures kept consistent with the old
+    // implementation for reuse by upper layers such as LanceDynamicTableSink)
     // ------------------------------------------------------------------------
 
     public RowType getRowType() {
@@ -129,14 +134,14 @@ public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommitta
     }
 
     // ------------------------------------------------------------------------
-    // Builder（与旧实现保持 100% 向后兼容）
+    // Builder (100% backward compatible with the old implementation)
     // ------------------------------------------------------------------------
 
     public static Builder builder() {
         return new Builder();
     }
 
-    /** 与旧实现签名一致的 Builder。 */
+    /** Builder with signatures consistent with the old implementation. */
     public static class Builder {
         private String path;
         private int batchSize = 1024;

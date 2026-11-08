@@ -65,12 +65,14 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Lance 聚合下推数据源（Flink 2.x 版本）。
+ * Lance aggregate-pushdown source (Flink 2.x version).
  *
- * <p>保留与旧实现一致的语义：全量扫描 → 累加 → 一次性输出聚合结果。
- * 聚合是全局的，不能并行累加（AggregateExecutor 非线程安全且结果需合并），因此
- * 发行一个 {@link LanceSplit.Kind#WHOLE_DATASET} split 并仅由并行度 0 的 reader 处理，
- * 其余 reader 收到 noMoreSplits 直接结束——与旧 {@code subtaskIndex != 0 跳过} 等价。
+ * <p>Keeps semantics consistent with the old implementation: full scan -> accumulate -> emit the
+ * aggregate result once. Aggregation is global and cannot be accumulated in parallel
+ * (AggregateExecutor is not thread-safe and results must be merged), so a single
+ * {@link LanceSplit.Kind#WHOLE_DATASET} split is emitted and handled only by the parallelism-0
+ * reader; other readers receive noMoreSplits and terminate immediately — equivalent to the old
+ * {@code subtaskIndex != 0 skip}.
  */
 public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEnumState> {
 
@@ -133,10 +135,11 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
     }
 
     public RowType getResultRowType() {
-        // 和旧实现保持一致：在 reader 实际初始化前，静态构造一个 executor 推导结果 RowType
+        // Keep consistent with the old implementation: statically construct an executor before the
+        // reader actually initializes to derive the result RowType.
         RowType srt = sourceRowType;
         if (srt == null) {
-            // 需要 dataset 才能推导，调用方应预先指定 sourceRowType
+            // Deriving requires the dataset; callers should pre-specify sourceRowType.
             return null;
         }
         AggregateExecutor exec = new AggregateExecutor(aggregateInfo, srt);
@@ -144,8 +147,8 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
     }
 
     // ========================================================================
-    // Enumerator：仅派发一个 WHOLE_DATASET split 给 reader 0，其余 reader 立即
-    // 收到 noMoreSplits。
+    // Enumerator: dispatch a single WHOLE_DATASET split to reader 0; other readers immediately
+    // receive noMoreSplits.
     // ========================================================================
     private static class SingleWholeDatasetEnumerator
             implements SplitEnumerator<LanceSplit, LanceEnumState> {
@@ -197,7 +200,7 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
     }
 
     // ========================================================================
-    // Reader：拿到 split 后全量扫描 + 累加，EOF 时输出聚合结果。
+    // Reader: after receiving a split, full scan + accumulate, emit the aggregate result on EOF.
     // ========================================================================
     private static class AggregateReader implements SourceReader<RowData, LanceSplit> {
 
@@ -254,7 +257,7 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
                 return resultIter.hasNext() ? InputStatus.MORE_AVAILABLE : InputStatus.END_OF_INPUT;
             }
             if (noMoreSplits) {
-                // reader 0 以外的 reader 走这里：没分到 split，直接 EOF
+                // Readers other than reader 0 take this path: no split assigned, EOF directly
                 return InputStatus.END_OF_INPUT;
             }
             return InputStatus.NOTHING_AVAILABLE;
@@ -327,7 +330,7 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
 
         @Override
         public List<LanceSplit> snapshotState(long checkpointId) {
-            // 聚合是全局的；运行到一半 failover 直接把当前 split 放回让其重跑
+            // Aggregation is global; on mid-run failover, put the current split back to re-run it
             List<LanceSplit> state = new ArrayList<>(pending);
             if (!aggregateDone && !pending.isEmpty()) {
                 return state;

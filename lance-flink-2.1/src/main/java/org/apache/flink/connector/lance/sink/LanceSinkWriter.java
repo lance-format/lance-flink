@@ -45,29 +45,32 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Lance 的 {@link CommittingSinkWriter}（Flink 2.1 的 2PC Writer 契约）。
+ * Lance's {@link CommittingSinkWriter} (the Flink 2.1 2PC writer contract).
  *
- * <p>B1 修复策略（Writer 几乎无状态 + OVERWRITE 预清理前移）：
+ * <p>B1 fix strategy (a nearly stateless writer + OVERWRITE pre-cleanup moved earlier):
  * <ul>
- *   <li>Writer 构造时**仅** subtask 0 执行一次性 OVERWRITE 预清理，而且是**在任何
- *       {@code Fragment.write()} 落盘之前完成**。这是 Lance 存储模型的物理约束：
- *       {@code Dataset.drop(path)} 会把 {@code <path>/data/} 下已经由 Writer
- *       物化的 {@code .lance} 文件一并清掉；如果把 drop 放到 Committer 阶段，
- *       同一次 commit 的 fragments 清单会指向被 drop 删掉的 {@code .lance}，
- *       导致后续 scan 报 "no such file"。
- *   <li>Writer **不再**判定 "是否首次写入" / "是否 createDataset"——这些决策统一交给
- *       {@link LanceCommitter}，它基于 {@link Dataset#open(String)} 探测目标是否
- *       有 manifest，天然串行且跨 subtask 一致。
- *   <li>每个 committable 都带上 {@code schema}，让 Committer 不管何时首次 commit
- *       都能用它建表（failover 后新 Writer 实例构造出的 committable 同样可建表）。
+ *   <li>On construction, only subtask 0 performs the one-time OVERWRITE pre-cleanup, and it must
+ *       complete <b>before any {@code Fragment.write()} hits disk</b>. This is a physical
+ *       constraint of the Lance storage model: {@code Dataset.drop(path)} also deletes any
+ *       {@code .lance} files under {@code <path>/data/} that the writer has already materialized;
+ *       if the drop were deferred to the committer phase, the fragment list of the same commit
+ *       would point at {@code .lance} files deleted by the drop, causing later scans to fail with
+ *       "no such file".
+ *   <li>The writer <b>no longer</b> decides "first write" / "whether to createDataset" — these
+ *       decisions are delegated to {@link LanceCommitter}, which probes for the manifest via
+ *       {@link Dataset#open(String)}, is naturally serial, and consistent across subtasks.
+ *   <li>Every committable carries {@code schema}, so the committer can always create the table on
+ *       first commit (a committable built by a new writer instance after failover can too).
  * </ul>
  *
- * <p><b>孤儿文件防护（#87）</b>：本类不再在 {@link #write(RowData, Context)} 内因
- * {@code write.batch-size} 满而物化 {@code .lance} 文件；行先缓冲在内存，物化统一延迟到
- * {@link #flush(boolean)} / {@link #prepareCommit()}。这样 TM 在 {@code write()} 与
- * {@code prepareCommit()} 之间 crash 时，磁盘上还没有任何文件可成为孤儿，writer 保持无状态。
- * 仅当估算的内存缓冲超过 {@code write.memory-cap-bytes} 时才会提前物化（OOM 安全阀，
- * 会重新打开一个窄的 orphan 窗口；默认 -1 无上限，永不提前物化）。
+ * <p><b>Orphan-file protection (#87)</b>: this class no longer materializes {@code .lance} files
+ * inside {@link #write(RowData, Context)} when {@code write.batch-size} is reached; rows are
+ * buffered in memory first, and materialization is deferred uniformly to
+ * {@link #flush(boolean)} / {@link #prepareCommit()}. As a result, when the TM crashes between
+ * {@code write()} and {@code prepareCommit()}, there is no file on disk that can become an orphan,
+ * and the writer stays stateless. Materialization only happens early when the estimated in-memory
+ * buffer exceeds {@code write.memory-cap-bytes} (the OOM safety valve, which reopens a narrow
+ * orphan window; the default -1 means unbounded, so write() never materializes).
  */
 public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommittable> {
 
@@ -81,16 +84,16 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     private final RowDataConverter converter;
     private final Schema arrowSchema;
 
-    /** 当前 checkpoint 窗口内已 flush 产生、待 commit 的 fragments。 */
+    /** Fragments flushed and pending commit within the current checkpoint window. */
     private final List<FragmentMetadata> pendingFragments = new ArrayList<>();
 
-    /** 行级内存 buffer：仅在 flush/prepareCommit 或 memory-cap 触发时物化。 */
+    /** Row-level in-memory buffer: materialized only on flush/prepareCommit or memory-cap trigger. */
     private final List<RowData> rowBuffer;
 
-    /** 每行的估算字节数（基于 rowType 字段类型的一次性估算，用于 memory-cap 触发）。 */
+    /** Estimated bytes per row (a one-time estimate from rowType field types, used for memory-cap). */
     private final long rowBytesEstimate;
 
-    /** 当前 rowBuffer 的累计估算字节数。 */
+    /** Cumulative estimated bytes currently buffered in rowBuffer. */
     private long estimatedBufferedBytes;
 
     private long totalRowsWritten;
@@ -111,9 +114,9 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
         this.rowBuffer = new ArrayList<>(options.getWriteBatchSize());
         this.rowBytesEstimate = estimateRowBytes(rowType);
 
-        // OVERWRITE 预清理：必须发生在 Fragment.write() 之前。只允许 subtask 0 执行，
-        // 其它 subtask 可能稍晚启动，等它们开始 write 时 drop 已完成。这里走 lance 侧
-        // Dataset.drop 以兼容本地 FS / HDFS / S3（Lance JNI 内部处理）。
+        // OVERWRITE pre-cleanup: must happen before Fragment.write(). Only subtask 0 runs it;
+        // other subtasks may start slightly later, by which time the drop has completed. It goes
+        // through Lance-side Dataset.drop to support local FS / HDFS / S3 (handled by Lance JNI).
         if (subtaskId == 0 && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
             try (Dataset ignored = Dataset.open(path, allocator)) {
                 LOG.info(
@@ -121,7 +124,7 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
                         path);
                 Dataset.drop(path, Collections.emptyMap());
             } catch (Throwable t) {
-                // dataset 不存在是常态，不记日志以降低噪声；drop 其它错误则 warn
+                // A missing dataset is the common case; skip logging to reduce noise, warn on other errors
                 LOG.debug("OVERWRITE pre-cleanup skip (dataset not open-able at {}): {}", path, t.toString());
             }
         }
@@ -139,9 +142,10 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
         rowBuffer.add(element);
         estimatedBufferedBytes += rowBytesEstimate;
 
-        // #87: 不再因 write.batch-size 满而物化；仅当内存缓冲超过 write.memory-cap-bytes
-        // 时提前物化（OOM 安全阀）。默认 -1（无上限）→ write() 阶段永不物化，彻底消除
-        // write() 与 prepareCommit() 之间的 orphan 文件窗口。
+        // #87: no longer materialize when write.batch-size is reached; only materialize early
+        // when the in-memory buffer exceeds write.memory-cap-bytes (the OOM safety valve). The
+        // default -1 (unbounded) means write() never materializes, fully eliminating the orphan
+        // file window between write() and prepareCommit().
         long memoryCap = options.getWriteMemoryCapBytes();
         if (memoryCap >= 0 && estimatedBufferedBytes >= memoryCap) {
             writeBufferAsFragment();
@@ -150,22 +154,22 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
 
     @Override
     public void flush(boolean endOfInput) throws IOException, InterruptedException {
-        // Flink runtime 在 checkpoint barrier 或 end-of-input 时调用；
-        // 把行级 buffer 清空成 fragment，后续 prepareCommit 一次性打包。
+        // Flink runtime calls this at a checkpoint barrier or end-of-input;
+        // drain the row-level buffer into a fragment, then prepareCommit packages it in one shot.
         writeBufferAsFragment();
     }
 
     @Override
     public Collection<LanceCommittable> prepareCommit() throws IOException, InterruptedException {
-        // 兜底：某些 runtime 版本可能跳过 flush 直接走 prepareCommit
+        // Fallback: some runtime versions may skip flush and go straight to prepareCommit
         writeBufferAsFragment();
 
         if (pendingFragments.isEmpty()) {
             return Collections.emptyList();
         }
 
-        // 无状态打包：每个 committable 都带上 schema 和 writeMode，由 Committer 决定
-        // Overwrite 建表 vs Append。Writer 侧不再做 createDataset 判定。
+        // Stateless packaging: every committable carries schema and writeMode, letting the
+        // Committer decide Overwrite-create vs Append. The writer no longer does createDataset.
         LanceCommittable committable =
                 new LanceCommittable(
                         options.getPath(),
@@ -179,8 +183,8 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     }
 
     /**
-     * 把 rowBuffer 里的数据写成一个 Lance Fragment 落盘，产生 FragmentMetadata；
-     * 不做 commit。
+     * Writes the data in rowBuffer to disk as a Lance Fragment, producing FragmentMetadata;
+     * does not commit.
      */
     private void writeBufferAsFragment() throws IOException {
         if (rowBuffer.isEmpty()) {
@@ -220,11 +224,12 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     }
 
     /**
-     * 估算单行的逻辑字节数（用于 memory-cap 触发判断，非精确值）。基于 rowType 的字段
-     * 类型给每个字段一个固定估算，可变长类型（字符串/二进制/复合类型等）取保守默认值。
+     * Estimates the logical byte size of a single row (used for the memory-cap trigger decision,
+     * not an exact value). Each field gets a fixed estimate based on its rowType field type, with
+     * conservative defaults for variable-length types (string/binary/composite etc.).
      */
     private static long estimateRowBytes(RowType rowType) {
-        long bytes = 16; // RowData 对象本身 + 内部数组的固定 overhead
+        long bytes = 16; // fixed overhead of the RowData object itself + its internal array
         for (LogicalType type : rowType.getChildren()) {
             bytes += estimateTypeBytes(type.getTypeRoot());
         }
@@ -257,10 +262,10 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
             case VARCHAR:
             case BINARY:
             case VARBINARY:
-                return 32; // 可变长类型取保守估算
+                return 32; // conservative estimate for variable-length types
             default:
-                // ARRAY / MAP / ROW / MULTISET / RAW / DISTINCT / STRUCTURED_TYPE / NULL 等
-                return 64; // 复合类型取保守估算
+                // ARRAY / MAP / ROW / MULTISET / RAW / DISTINCT / STRUCTURED_TYPE / NULL etc.
+                return 64; // conservative estimate for composite types
         }
     }
 

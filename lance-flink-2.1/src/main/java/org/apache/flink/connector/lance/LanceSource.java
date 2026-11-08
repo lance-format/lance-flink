@@ -39,13 +39,14 @@ import org.apache.flink.table.types.logical.RowType;
 import java.util.List;
 
 /**
- * Lance 数据源（Flink 2.x 版本，基于 FLIP-27 Source V2）。
+ * Lance source (Flink 2.x version, based on FLIP-27 Source V2).
  *
- * <p>构造函数与 Builder 签名刻意保持与旧 1.x 实现兼容，使得上层
- * {@link org.apache.flink.connector.lance.table.LanceDynamicTableSource} 等调用方
- * 在同一份共享源码下无需变更即可编译到两套 Flink 版本。
+ * <p>The constructor and Builder signatures are deliberately kept compatible with the old 1.x
+ * implementation so that upper-layer callers such as
+ * {@link org.apache.flink.connector.lance.table.LanceDynamicTableSource} can compile against both
+ * Flink versions without changes in the shared source.
  *
- * <p>使用示例：
+ * <p>Usage example:
  * <pre>{@code
  * LanceSource source = LanceSource.builder()
  *     .path("/path/to/lance/dataset")
@@ -75,7 +76,7 @@ public class LanceSource implements Source<RowData, LanceSplit, LanceEnumState> 
 
     @Override
     public Boundedness getBoundedness() {
-        // Lance connector 当前仅支持批模式读
+        // The Lance connector currently only supports batch-mode reads
         return Boundedness.BOUNDED;
     }
 
@@ -106,7 +107,7 @@ public class LanceSource implements Source<RowData, LanceSplit, LanceEnumState> 
         return LanceEnumStateSerializer.INSTANCE;
     }
 
-    // ---------- getters（保持与旧实现一致的对外契约） ----------
+    // ---------- getters (kept consistent with the old implementation's public contract) ----------
 
     public RowType getRowType() {
         return rowType;
@@ -122,9 +123,9 @@ public class LanceSource implements Source<RowData, LanceSplit, LanceEnumState> 
     }
 
     /**
-     * {@code TypeInformation} 导出接口（部分调用方可能需要）。此处留空由
-     * {@link org.apache.flink.table.runtime.typeutils.InternalTypeInfo#of(RowType)}
-     * 的调用方自行构造；保持 API 兼容性即可。
+     * {@code TypeInformation} export hook (some callers may need it). Left empty here so that
+     * callers of {@link org.apache.flink.table.runtime.typeutils.InternalTypeInfo#of(RowType)}
+     * construct it themselves; keeping API compatibility is sufficient.
      */
     @SuppressWarnings("unused")
     private TypeInformation<RowData> producedTypeInfo() {
@@ -137,7 +138,7 @@ public class LanceSource implements Source<RowData, LanceSplit, LanceEnumState> 
         return new Builder();
     }
 
-    /** 与旧实现签名一致的 Builder。 */
+    /** Builder with signatures consistent with the old implementation. */
     public static class Builder {
         private String path;
         private int batchSize = 1024;

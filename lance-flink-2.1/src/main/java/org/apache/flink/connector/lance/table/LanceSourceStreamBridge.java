@@ -25,15 +25,15 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
 
 /**
- * Flink 版本桥接：把 {@link LanceSource} 挂载为 {@link DataStream}。
+ * Flink version bridge: mounts {@link LanceSource} as a {@link DataStream}.
  *
- * <p>本文件是「Flink 2.x 版本」：{@code LanceSource} 实现 FLIP-27 的
- * {@code Source<RowData, LanceSplit, LanceEnumState>}，走
- * {@link StreamExecutionEnvironment#fromSource}。Lance connector 当前仅批读，
- * 使用 {@link WatermarkStrategy#noWatermarks()} 即可。
+ * <p>This file is the "Flink 2.x version": {@code LanceSource} implements the FLIP-27
+ * {@code Source<RowData, LanceSplit, LanceEnumState>}, via
+ * {@link StreamExecutionEnvironment#fromSource}. The Lance connector currently only supports
+ * batch reads, so {@link WatermarkStrategy#noWatermarks()} suffices.
  *
- * <p>这是对根 src 中同名类（1.x 版本）的覆盖；根 src 版本已通过 2.1 模块 pom 的
- * maven-compiler-plugin {@code <excludes>} 排除。
+ * <p>This overrides the same-named class in the root src (the 1.x version); the root-src version
+ * is excluded via maven-compiler-plugin {@code <excludes>} in the 2.1 module pom.
  */
 final class LanceSourceStreamBridge {
 

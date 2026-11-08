@@ -47,14 +47,16 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Sink V2 版本的 append 并发 ITCase：两个 {@link LanceSinkWriter} subtask 并发首次写入
- * 不存在的 dataset，经 {@link LanceCommitter} 聚合提交，验证不互相覆盖（回归：
- * 首次写入用 Overwrite 时静默丢弃另一个 subtask 的行）。
+ * Sink V2 version of the append concurrency ITCase: two {@link LanceSinkWriter} subtasks
+ * concurrently first-write a non-existent dataset, aggregated and committed via
+ * {@link LanceCommitter}, verifying they do not overwrite each other (regression: the first write
+ * silently dropping the other subtask's rows when it used Overwrite).
  *
- * <p>这是根 src 中 1.x {@code LanceSinkConcurrencyITCase}（{@code RichSinkFunction} 的
- * {@code open/invoke/flush/close} 生命周期）在 Flink 2.1 下的等价重写；根 src 的 1.x
- * 版本已删除（其测试的 RichSinkFunction 生命周期在 Flink 2.x 已移除），本类以同名同包
- * 的 Sink V2 形式承载并发首次写入语义测试。
+ * <p>This is the Flink 2.1 equivalent rewrite of the 1.x {@code LanceSinkConcurrencyITCase} in root
+ * src (the {@code RichSinkFunction} {@code open/invoke/flush/close} lifecycle); the 1.x version in
+ * root src has been deleted (the RichSinkFunction lifecycle it tested was removed in Flink 2.x).
+ * This class carries the concurrent-first-write semantics test in Sink V2 form under the same
+ * package and name.
  */
 class LanceSinkConcurrencyITCase {
 
@@ -104,7 +106,7 @@ class LanceSinkConcurrencyITCase {
     }
 
     @Test
-    @DisplayName("两个 append subtask 并发首次写入不同行不丢数据")
+    @DisplayName("Two append subtasks concurrently first-write distinct rows without data loss")
     void twoSubtasksConcurrentFirstWrite() throws Exception {
         String path = tempDir.resolve("concurrent_append").toString();
 
@@ -122,8 +124,8 @@ class LanceSinkConcurrencyITCase {
             requests.add(new FakeCommitRequest(c));
         }
 
-        // LanceCommitter 按 datasetPath 分桶聚合，首次建表用 Overwrite 包含全部 fragments，
-        // 不丢第二个 subtask 的行。
+        // LanceCommitter buckets/aggregates by datasetPath; the first table creation uses Overwrite
+        // with all fragments, so the second subtask's rows are not lost.
         try (LanceCommitter committer = new LanceCommitter()) {
             committer.commit(requests);
         }
