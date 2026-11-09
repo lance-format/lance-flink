@@ -2,17 +2,16 @@
 
 ## Requirements
 
-* JDK 11 or higher
+* JDK 11+ (Flink 1.20) or JDK 17+ (Flink 2.1)
 * Maven 3.6+
-* Apache Flink 1.18 / 1.19 / 1.20
+* Apache Flink 1.20 / 2.1
 
 The connector ships one artifact per supported Flink minor version:
 
-| Flink version | Artifact |
-|---|---|
-| 1.18 | `lance-flink-1.18` |
-| 1.19 | `lance-flink-1.19` |
-| 1.20 | `lance-flink-1.20` |
+| Flink version | Artifact | Required JDK |
+|---|---|---|
+| 1.20 | `lance-flink-1.20` | JDK 11+ |
+| 2.1 | `lance-flink-2.1` | JDK 17+ |
 
 ## Dependencies
 
@@ -28,8 +27,8 @@ supported platform (linux-x86-64, linux-aarch64, darwin-aarch64).
 ```xml
 <dependency>
     <groupId>org.apache.flink</groupId>
-    <artifactId>lance-flink-1.18</artifactId>
-    <version>0.1.0</version>
+    <artifactId>lance-flink-2.1</artifactId>
+    <version>0.2.0</version>
 </dependency>
 ```
 
@@ -39,7 +38,7 @@ supported platform (linux-x86-64, linux-aarch64, darwin-aarch64).
 mvn clean verify
 ```
 
-The build produces a fat jar per module (e.g. `lance-flink-1.18/target/lance-flink-1.18-*.jar`).
+The build produces a fat jar per module (e.g. `lance-flink-2.1/target/lance-flink-2.1-*.jar`).
 Add the jar to your Flink cluster or job classpath, then use the `lance` / `lance-namespace`
 catalog types in SQL.
 

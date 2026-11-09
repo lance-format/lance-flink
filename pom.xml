@@ -5,7 +5,7 @@
 
     <groupId>org.apache.flink</groupId>
     <artifactId>lance-flink-root</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <packaging>pom</packaging>
 
     <name>Lance Flink Connector</name>
@@ -28,7 +28,7 @@
         <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
 
         <!-- Lance Flink Connector version -->
-        <lance-flink.version>0.1.0</lance-flink.version>
+        <lance-flink.version>0.2.0</lance-flink.version>
 
         <!-- Lance dependency version -->
         <lance.version>7.0.0</lance.version>
