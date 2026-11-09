@@ -63,22 +63,15 @@
 > 本 connector 在 1.20 和 2.1 上共享大部分源码，仅对版本不兼容部分通过模块隔离
 > （`lance-flink-2.1/` 子模块）提供替代实现。
 
-> **⚠️ Flink 2.1 OVERWRITE 并行度局限（R3）**：Flink 2.1 上 `write.mode = overwrite` 的"预清理" 由 `LanceSinkWriter` 的 subtask 0 在 `Fragment.write()` 之前触发；不同 subtask 之间没有 barrier。
-> 在真实集群启动时序偏斜的情况下，subtask-N (N>0) 可能在 subtask 0 完成 `Dataset.drop` 之前就已经 `Fragment.write()` —— 它刚物化的 `.lance` 文件会被随后到来的 drop 一并删掉，导致当前 checkpoint 窗口丢数据。
->
-> **缓解措施**（二选一）：
-> 1. **推荐**：对 OVERWRITE 作业显式 `sink.parallelism = 1`（SQL 侧用 `'sink.parallelism' = '1'` 表选项，DataStream 侧用 `dataStream.sinkTo(sink).setParallelism(1)`）；
-> 2. 作业编排：先用 parallelism=1 跑一个 OVERWRITE truncate，再启动真正的 parallelism=N 的 APPEND 作业。
->
-> 该局限只影响 Flink 2.1 + OVERWRITE + 并行度>1 的组合；APPEND 模式与 Flink 1.20 不受影响。tracking issue 见 follow-up。
+> **Flink 2.1 OVERWRITE 语义**：`write.mode = overwrite` 的「每个 job 替换一次」判定由串行的 `LanceCommitter` 承担 —— `LanceSinkWriter` 不再执行任何 `Dataset.drop` 预清理。Committer 给它在 OVERWRITE 模式下产生的每个版本都打上 `flink.job-id` transaction property：job 首次提交执行 `Overwrite` 替换旧数据集，后续 checkpoint 提交自动切换为 `Append`，因此 OVERWRITE 作业可以安全地以并行度 > 1 运行。
 
 ### Maven Dependency
 
 ```xml
 <dependency>
     <groupId>org.apache.flink</groupId>
-    <artifactId>flink-connector-lance</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <artifactId>lance-flink-2.1</artifactId>
+    <version>0.2.0</version>
 </dependency>
 ```
 

@@ -11,7 +11,7 @@ temporary function before use:
 ```sql
 CREATE TEMPORARY FUNCTION vector_search AS
     'org.apache.flink.connector.lance.table.LanceVectorSearchFunction'
-    LANGUAGE JAVA USING JAR '/path/to/lance-flink-1.18-0.1.0.jar';
+    LANGUAGE JAVA USING JAR '/path/to/lance-flink-2.1-0.2.0.jar';
 ```
 
 The registered function name (here `vector_search`) is user-chosen. Its `eval` overloads are:
