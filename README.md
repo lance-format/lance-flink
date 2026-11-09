@@ -11,12 +11,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hashmapybx/flink-connector-lance/blob/main/LICENSE">
+  <a href="https://github.com/lance-format/lance-flink/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/>
   </a>
-  <a href="https://github.com/hashmapybx/flink-connector-lance/actions">
+  <a href="https://github.com/lance-format/lance-flink/actions">
     <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status"/>
   </a>
+  <img src="https://img.shields.io/badge/release-0.2.0-blue.svg" alt="Release"/>
   <img src="https://img.shields.io/badge/flink-1.20%20%7C%202.1-orange.svg" alt="Flink Version"/>
   <img src="https://img.shields.io/badge/lance-7.0.0-purple.svg" alt="Lance Version"/>
   <img src="https://img.shields.io/badge/java-11%20%7C%2017-red.svg" alt="Java Version"/>
@@ -33,7 +34,7 @@
 
 ## 📖 Overview
 
-`flink-connector-lance` is a high-performance Apache Flink connector for [Lance](https://lancedb.github.io/lance/), a modern columnar data format optimized for machine learning workloads and vector search. This connector enables seamless integration between Flink's powerful stream/batch processing capabilities and Lance's efficient vector storage.
+`lance-flink` is a high-performance Apache Flink connector for [Lance](https://lancedb.github.io/lance/), a modern columnar data format optimized for machine learning workloads and vector search. This connector enables seamless integration between Flink's powerful stream/batch processing capabilities and Lance's efficient vector storage.
 
 ## ✨ Features
 
@@ -44,8 +45,11 @@
 | 🔍 **Vector Search** | KNN search with L2, Cosine, Dot metrics |
 | 📇 **Index Building** | IVF_PQ, IVF_HNSW, IVF_FLAT indexes |
 | ✅ **Exactly-Once** | Checkpoint-based exactly-once semantics |
-| 🎯 **Predicate Pushdown** | Filter pushdown for optimized reads |
-| 📁 **Catalog Support** | Lance Catalog for metadata management |
+| 🔑 **Upsert & Delete** | Primary-key (including composite) changelog ingestion |
+| 🧬 **Schema Evolution** | `ALTER TABLE` add / rename / widen / drop columns |
+| 🕰️ **Time Travel** | Read historical versions by version or timestamp |
+| 🎯 **Predicate Pushdown** | Projection, filter, limit and aggregate pushdown |
+| 📁 **Catalog Support** | `lance` and `lance-namespace` (dir / rest) catalogs |
 
 ## 🚀 Quick Start
 
@@ -53,8 +57,8 @@
 
 | Flink Version | Required JDK | Build Module |
 |---------------|--------------|--------------|
-| **1.20.x**    | JDK 11 或 17 或 21 | `lance-flink-1.20` |
-| **2.1.x**     | JDK 17 或 21 | `lance-flink-2.1` |
+| **1.20.x**    | JDK 11 / 17 / 21 | `lance-flink-1.20` |
+| **2.1.x**     | JDK 17 / 21 | `lance-flink-2.1` |
 
 - Maven 3.6+
 - Lance 7.0.0 Java SDK
@@ -62,12 +66,23 @@
 > **注意**：Flink 2.x 对 Source/Sink API 进行了重大重构（FLIP-27 Source V2 + Sink V2 + `SupportsCommitter`）。
 > 本 connector 在 1.20 和 2.1 上共享大部分源码，仅对版本不兼容部分通过模块隔离
 > （`lance-flink-2.1/` 子模块）提供替代实现。
+>
+> Flink 1.18 / 1.19 自 0.2.0 起不再构建与发布（两者在 Flink 2.1 适配落地前均已 EOL），
+> 对应 artifact 停留在 0.1.0。
 
 > **Flink 2.1 OVERWRITE 语义**：`write.mode = overwrite` 的「每个 job 替换一次」判定由串行的 `LanceCommitter` 承担 —— `LanceSinkWriter` 不再执行任何 `Dataset.drop` 预清理。Committer 给它在 OVERWRITE 模式下产生的每个版本都打上 `flink.job-id` transaction property：job 首次提交执行 `Overwrite` 替换旧数据集，后续 checkpoint 提交自动切换为 `Append`，因此 OVERWRITE 作业可以安全地以并行度 > 1 运行。
 
 ### Maven Dependency
 
 ```xml
+<!-- Flink 1.20 -->
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>lance-flink-1.20</artifactId>
+    <version>0.2.0</version>
+</dependency>
+
+<!-- Flink 2.1 -->
 <dependency>
     <groupId>org.apache.flink</groupId>
     <artifactId>lance-flink-2.1</artifactId>
@@ -100,7 +115,7 @@ SELECT * FROM vectors WHERE id > 0;
 ### DataStream API Example
 
 ```java
-// Read from Lance (Flink 2.x：FLIP-27 Source V2)
+// Read from Lance
 LanceSource source = LanceSource.builder()
     .path("/data/vectors")
     .batchSize(1024)
@@ -108,13 +123,12 @@ LanceSource source = LanceSource.builder()
     .rowType(rowType)
     .build();
 
-// Flink 2.x
-// DataStream<RowData> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "lance");
-// Flink 1.20 (legacy SourceFunction)
-// DataStream<RowData> stream = env.addSource(source);
+// Flink 2.1: FLIP-27 Source V2
 DataStream<RowData> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "lance");
+// Flink 1.20: legacy SourceFunction
+// DataStream<RowData> stream = env.addSource(source);
 
-// Write to Lance (Flink 2.x：TwoPhaseCommittingSink → Exactly-Once)
+// Write to Lance (Sink V2 on Flink 2.1, RichSinkFunction on Flink 1.20)
 LanceSink sink = LanceSink.builder()
     .path("/data/output")
     .batchSize(1024)
@@ -122,11 +136,10 @@ LanceSink sink = LanceSink.builder()
     .rowType(rowType)
     .build();
 
-// Flink 2.x
-// stream.sinkTo(sink);
-// Flink 1.20 (legacy SinkFunction)
-// stream.addSink(sink);
+// Flink 2.1
 stream.sinkTo(sink);
+// Flink 1.20
+// stream.addSink(sink);
 ```
 
 ## 📚 Documentation
@@ -152,9 +165,12 @@ USE CATALOG lance_catalog;
 | `connector` | ✅ | - | Must be `lance` |
 | `path` | ✅ | - | Lance dataset path |
 | `read.batch-size` | ❌ | 1024 | Read batch size |
+| `read.version` | ❌ | latest | Read a specific historical version |
+| `read.as-of-timestamp` | ❌ | - | Read the version valid at this timestamp |
 | `write.batch-size` | ❌ | 1024 | Write batch size |
 | `write.mode` | ❌ | append | `append` or `overwrite` |
 | `write.max-rows-per-file` | ❌ | 1000000 | Max rows per file |
+| `write.memory-cap-bytes` | ❌ | -1 (unbounded) | Buffered-bytes threshold that forces an early fragment materialization |
 
 ### Vector Index Building
 
@@ -275,38 +291,43 @@ search.close();
 ## 🏗️ Project Structure
 
 ```
-flink-connector-lance/
-├── src/main/java/org/apache/flink/connector/lance/
-│   ├── LanceSource.java           # Source implementation
-│   ├── LanceSink.java             # Sink with checkpointing
-│   ├── LanceInputFormat.java      # Batch input format
-│   ├── LanceIndexBuilder.java     # Vector index builder
-│   ├── LanceVectorSearch.java     # KNN search
-│   ├── config/
-│   │   └── LanceOptions.java      # Configuration options
-│   ├── converter/
-│   │   ├── LanceTypeConverter.java
-│   │   └── RowDataConverter.java
-│   └── table/
-│       ├── LanceDynamicTableFactory.java
-│       ├── LanceDynamicTableSource.java
-│       ├── LanceDynamicTableSink.java
-│       ├── LanceCatalog.java
-│       └── LanceVectorSearchFunction.java
-└── src/test/java/                 # Unit & integration tests
+lance-flink/
+├── pom.xml                          # parent POM (aggregates the two modules below)
+├── lance-flink-1.20/                # Flink 1.20 build (JDK 11+)
+├── lance-flink-2.1/                 # Flink 2.1 build (JDK 17+, FLIP-27 / Sink V2 overrides)
+├── src/main/java/org/apache/flink/connector/lance/   # shared sources (both modules)
+│   ├── LanceSource.java             # Source (Flink 1.20 legacy; overridden in 2.1)
+│   ├── LanceSink.java               # Sink with checkpointing (overridden in 2.1)
+│   ├── LanceUpsertSink.java         # Primary-key upsert / delete
+│   ├── LanceInputFormat.java        # Batch input format
+│   ├── LanceIndexBuilder.java       # Vector index builder
+│   ├── LanceVectorSearch.java       # KNN search
+│   ├── config/LanceOptions.java     # Configuration options
+│   ├── converter/                   # RowData <-> Arrow conversion
+│   ├── catalog/namespace/           # lance-namespace catalog configuration
+│   ├── util/                        # Lance opener / Hadoop path resolver
+│   └── table/                       # Table API, SQL factory, catalogs, UDFs
+└── src/test/java/                   # unit & integration tests (*ITCase for surefire)
 ```
 
 ## 🔧 Build
 
 ```bash
+# Build both modules with tests (JDK 17+ required for the Flink 2.1 module)
+mvn clean package
+
 # Build without tests
 mvn clean package -DskipTests
 
-# Build with tests
-mvn clean package
-
-# Run tests only
+# Run every test
 mvn test
+
+# Build / test a single module
+mvn -pl lance-flink-2.1 test
+mvn -pl lance-flink-1.20 test
+
+# Check formatting before committing
+mvn spotless:check
 ```
 
 ## 🤝 Contributing
@@ -322,6 +343,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📋 Roadmap
 
 - [x] **Flink 2.1 支持**（FLIP-27 Source V2 + Sink V2 / `SupportsCommitter`，要求 JDK 17+，见 #85）
+- [x] **主键 Upsert / Delete 与 Schema Evolution**（见 #76）
+- [x] **Time Travel**（`read.version` / `read.as-of-timestamp`）
+- [x] **Hadoop 系文件系统读取**（`hdfs://` / `tbdsfs://` / `viewfs://`）
 - [ ] Streaming CDC support
 - [ ] Delta Lake interoperability
 - [ ] Distributed index building

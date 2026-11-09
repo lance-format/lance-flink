@@ -39,9 +39,9 @@
         <!-- Arrow version (overridable per version module) -->
         <arrow.version>18.3.0</arrow.version>
 
-        <!-- Flink multi-version (note: 1.17 reached EOL in 2024-10; 1.18/1.19 are no longer
-             maintained once Flink 2.1 support landed, keeping only the last stable 1.x release
-             1.20 and the first 2.x adaptation 2.1.1) -->
+        <!-- Flink multi-version (note: 1.17 reached EOL in 2024-10; 1.18 / 1.19 were dropped
+             once Flink 2.1 support landed — only the last stable 1.x release 1.20 and the
+             first 2.x adaptation 2.1.1 are maintained) -->
         <flink120.version>1.20.0</flink120.version>
         <flink21.version>2.1.1</flink21.version>
         <!-- Default Flink version, overridden by submodules -->
