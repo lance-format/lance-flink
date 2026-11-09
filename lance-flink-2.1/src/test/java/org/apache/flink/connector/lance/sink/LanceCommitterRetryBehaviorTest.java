@@ -287,6 +287,13 @@ class LanceCommitterRetryBehaviorTest {
 
         @Override
         protected void executeTransaction(String path, Operation op) throws IOException {
+            executeTransaction(path, op, null);
+        }
+
+        @Override
+        protected void executeTransaction(
+                String path, Operation op, java.util.Map<String, String> properties)
+                throws IOException {
             if (executeFailure != null) {
                 if (executeFailure instanceof RuntimeException) {
                     throw (RuntimeException) executeFailure;
@@ -297,14 +304,17 @@ class LanceCommitterRetryBehaviorTest {
                 throw new IOException(executeFailure);
             }
             if (!executeSuccess) {
-                throw new IOException("TestLanceCommitter: neither failure nor success was configured");
+                throw new IOException(
+                        "TestLanceCommitter: neither failure nor success was configured");
             }
             // success: fall through
         }
 
         @Override
         protected int maxRetries() {
-            return maxRetriesOverride == Integer.MIN_VALUE ? super.maxRetries() : maxRetriesOverride;
+            return maxRetriesOverride == Integer.MIN_VALUE
+                    ? super.maxRetries()
+                    : maxRetriesOverride;
         }
     }
 

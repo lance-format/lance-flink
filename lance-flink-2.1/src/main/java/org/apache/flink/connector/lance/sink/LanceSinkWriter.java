@@ -31,7 +31,6 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.WriteParams;
@@ -47,20 +46,17 @@ import java.util.List;
 /**
  * Lance's {@link CommittingSinkWriter} (the Flink 2.1 2PC writer contract).
  *
- * <p>B1 fix strategy (a nearly stateless writer + OVERWRITE pre-cleanup moved earlier):
+ * <p>The writer is stateless and only materializes RowData batches into Lance fragment data files:
+ *
  * <ul>
- *   <li>On construction, only subtask 0 performs the one-time OVERWRITE pre-cleanup, and it must
- *       complete <b>before any {@code Fragment.write()} hits disk</b>. This is a physical
- *       constraint of the Lance storage model: {@code Dataset.drop(path)} also deletes any
- *       {@code .lance} files under {@code <path>/data/} that the writer has already materialized;
- *       if the drop were deferred to the committer phase, the fragment list of the same commit
- *       would point at {@code .lance} files deleted by the drop, causing later scans to fail with
- *       "no such file".
- *   <li>The writer <b>no longer</b> decides "first write" / "whether to createDataset" — these
- *       decisions are delegated to {@link LanceCommitter}, which probes for the manifest via
- *       {@link Dataset#open(String)}, is naturally serial, and consistent across subtasks.
- *   <li>Every committable carries {@code schema}, so the committer can always create the table on
- *       first commit (a committable built by a new writer instance after failover can too).
+ *   <li>It performs <b>no</b> OVERWRITE pre-cleanup (no {@code Dataset.drop}) and no
+ *       "first write / create the dataset" decision — those are delegated to the serial
+ *       {@link LanceCommitter}, which probes the target's manifest and tags every version it
+ *       commits with the {@code flink.job-id} transaction property to make the overwrite happen
+ *       once per job.
+ *   <li>Every committable carries {@code schema} and {@code writeMode}, so the committer can always
+ *       create the table on first commit (a committable built by a new writer instance after
+ *       failover can too).
  * </ul>
  *
  * <p><b>Orphan-file protection (#87)</b>: this class no longer materializes {@code .lance} files
@@ -87,10 +83,10 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
     /** Fragments flushed and pending commit within the current checkpoint window. */
     private final List<FragmentMetadata> pendingFragments = new ArrayList<>();
 
-    /** Row-level in-memory buffer: materialized only on flush/prepareCommit or memory-cap trigger. */
+    /** Row-level in-memory buffer: materialized only on flush/prepareCommit or memory-cap. */
     private final List<RowData> rowBuffer;
 
-    /** Estimated bytes per row (a one-time estimate from rowType field types, used for memory-cap). */
+    /** Estimated bytes per row (one-time estimate from rowType field types, for memory-cap). */
     private final long rowBytesEstimate;
 
     /** Cumulative estimated bytes currently buffered in rowBuffer. */
@@ -113,21 +109,6 @@ public class LanceSinkWriter implements CommittingSinkWriter<RowData, LanceCommi
         this.arrowSchema = LanceTypeConverter.toArrowSchema(rowType);
         this.rowBuffer = new ArrayList<>(options.getWriteBatchSize());
         this.rowBytesEstimate = estimateRowBytes(rowType);
-
-        // OVERWRITE pre-cleanup: must happen before Fragment.write(). Only subtask 0 runs it;
-        // other subtasks may start slightly later, by which time the drop has completed. It goes
-        // through Lance-side Dataset.drop to support local FS / HDFS / S3 (handled by Lance JNI).
-        if (subtaskId == 0 && options.getWriteMode() == LanceOptions.WriteMode.OVERWRITE) {
-            try (Dataset ignored = Dataset.open(path, allocator)) {
-                LOG.info(
-                        "OVERWRITE mode, dropping existing dataset at {} (subtask 0, pre-write cleanup)",
-                        path);
-                Dataset.drop(path, Collections.emptyMap());
-            } catch (Throwable t) {
-                // A missing dataset is the common case; skip logging to reduce noise, warn on other errors
-                LOG.debug("OVERWRITE pre-cleanup skip (dataset not open-able at {}): {}", path, t.toString());
-            }
-        }
 
         LOG.info(
                 "LanceSinkWriter[{}] opened: path={}, batchSize={}, writeMode={}",
