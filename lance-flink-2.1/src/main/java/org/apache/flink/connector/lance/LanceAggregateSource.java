@@ -323,9 +323,27 @@ public class LanceAggregateSource implements Source<RowData, LanceSplit, LanceEn
                 Schema sc = dataset.getSchema();
                 rt = LanceTypeConverter.toFlinkRowType(sc);
             }
-            this.converter = new RowDataConverter(rt);
-            this.executor = new AggregateExecutor(aggregateInfo, rt);
+            // The scanner returns only the selected columns; both the converter and the aggregate
+            // executor must index into that narrower layout, not the full table schema.
+            RowType readRowType = projectedRowType(rt);
+            this.converter = new RowDataConverter(readRowType);
+            this.executor = new AggregateExecutor(aggregateInfo, readRowType);
             this.executor.init();
+        }
+
+        /** Builds the {@link RowType} describing the columns actually read from Lance. */
+        private RowType projectedRowType(RowType fullRowType) {
+            if (selectedColumns == null || selectedColumns.length == 0) {
+                return fullRowType;
+            }
+            List<RowType.RowField> fields = new ArrayList<>();
+            for (String column : selectedColumns) {
+                int index = fullRowType.getFieldNames().indexOf(column);
+                if (index >= 0) {
+                    fields.add(fullRowType.getFields().get(index));
+                }
+            }
+            return fields.isEmpty() ? fullRowType : new RowType(fields);
         }
 
         @Override

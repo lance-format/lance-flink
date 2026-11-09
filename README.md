@@ -46,7 +46,7 @@
 | 📇 **Index Building** | IVF_PQ, IVF_HNSW, IVF_FLAT indexes |
 | ✅ **Exactly-Once** | Checkpoint-based exactly-once semantics |
 | 🔑 **Upsert & Delete** | Primary-key (including composite) changelog ingestion |
-| 🧬 **Schema Evolution** | `ALTER TABLE` add / rename / widen / drop columns |
+| 🧬 **Schema Evolution** | `ALTER TABLE` add / rename / drop columns (via the `lance` catalog) |
 | 🕰️ **Time Travel** | Read historical versions by version or timestamp |
 | 🎯 **Predicate Pushdown** | Projection, filter, limit and aggregate pushdown |
 | 📁 **Catalog Support** | `lance` and `lance-namespace` (dir / rest) catalogs |

@@ -29,7 +29,8 @@ The connector is built on the Flink Table API (`DynamicTableSource` / `DynamicTa
   `+I` / `+U` / `-D` changelogs through `Dataset.mergeInsert`.
 * **Schema Evolution**: `ALTER TABLE` add / rename / drop columns through the `lance` catalog.
 * **Column, Filter, Limit & Aggregate Pushdown**: push projections, `WHERE` predicates, limits and
-  aggregations down to Lance for efficient scans.
+  global aggregates (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) down to Lance for efficient scans.
+  Grouped aggregates are computed by Flink.
 * **Vector Search**: KNN search over `ARRAY<FLOAT>` columns with `L2`, `Cosine`, and `Dot` metrics,
   via the `LanceVectorSearchFunction` table function.
 * **Vector Index Building**: create `IVF_PQ`, `IVF_HNSW`, and `IVF_FLAT` indexes.

@@ -123,6 +123,10 @@ public class LanceVectorSearchFunction extends TableFunction<Row> {
                         metric != null ? metric : "L2"
                 );
                 
+                // The table-function signature only exposes the metric; the remaining search
+                // knobs (vector.nprobes / vector.ef / vector.refine-factor) are not reachable
+                // from SQL, so the LanceVectorSearch defaults apply here. Build the searcher
+                // directly with LanceVectorSearch.builder() when those must be tuned.
                 vectorSearch = LanceVectorSearch.builder()
                         .datasetPath(datasetPath)
                         .columnName(columnName)

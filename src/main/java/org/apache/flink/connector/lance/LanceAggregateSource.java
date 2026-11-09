@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -71,6 +72,9 @@ public class LanceAggregateSource extends RichParallelSourceFunction<RowData> {
     private final RowType sourceRowType;
     private final AggregateInfo aggregateInfo;
     private final String[] selectedColumns;
+
+    /** Row type matching the columns actually read; the aggregate executor indexes into it. */
+    private transient RowType fullRowType;
 
     private transient volatile boolean running;
     private transient BufferAllocator allocator;
@@ -124,10 +128,13 @@ public class LanceAggregateSource extends RichParallelSourceFunction<RowData> {
             Schema arrowSchema = dataset.getSchema();
             actualRowType = LanceTypeConverter.toFlinkRowType(arrowSchema);
         }
-        this.converter = new RowDataConverter(actualRowType);
-
+        this.fullRowType = actualRowType;
+        // The scanner returns only the selected columns, so the converter and the aggregate
+        // executor must both work against that narrower layout.
+        RowType readRowType = projectedRowType();
+        this.converter = new RowDataConverter(readRowType);
         // Initialize aggregate executor
-        this.aggregateExecutor = new AggregateExecutor(aggregateInfo, actualRowType);
+        this.aggregateExecutor = new AggregateExecutor(aggregateInfo, readRowType);
         this.aggregateExecutor.init();
 
         LOG.info("Lance aggregate data source opened");
@@ -255,6 +262,28 @@ public class LanceAggregateSource extends RichParallelSourceFunction<RowData> {
                 ctx.collect(result);
             }
         }
+    }
+
+    /**
+     * Builds the {@link RowType} describing the columns actually read from Lance.
+     *
+     * <p>The aggregate executor resolves column names to field indices, so it must see exactly the
+     * layout of the rows the scanner produces. Scanning a subset of columns yields a narrower row
+     * type than the table schema, and using the full schema would misalign every index after the
+     * first projected column.
+     */
+    private RowType projectedRowType() {
+        if (selectedColumns == null || selectedColumns.length == 0) {
+            return fullRowType;
+        }
+        List<RowType.RowField> fields = new ArrayList<>();
+        for (String column : selectedColumns) {
+            int index = fullRowType.getFieldNames().indexOf(column);
+            if (index >= 0) {
+                fields.add(fullRowType.getFields().get(index));
+            }
+        }
+        return fields.isEmpty() ? fullRowType : new RowType(fields);
     }
 
     @Override
