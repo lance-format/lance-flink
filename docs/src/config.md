@@ -27,9 +27,15 @@ catalog types are `'lance'` (directory/S3) and `'lance-namespace'` (dir/rest).
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `write.batch-size` | ❌ | 1024 | Write batch size |
+| `write.batch-size` | ❌ | 1024 | Rows buffered per writer before a flush. Controls flush granularity, not disk layout: rows are materialized on `flush()` / `prepareCommit()` |
 | `write.mode` | ❌ | append | `append` or `overwrite` |
 | `write.max-rows-per-file` | ❌ | 1000000 | Maximum rows per data file |
+| `write.memory-cap-bytes` | ❌ | -1 | Estimated in-memory buffer size that forces an early fragment materialization. `-1` means unbounded — `write()` never materializes, which removes the orphan-file window but makes memory usage grow with the checkpoint interval |
+
+> **`write.mode = overwrite`**: the dataset is replaced **once per job**. The decision lives in the
+> serial committer, which tags every version it commits with the `flink.job-id` transaction
+> property: the first commit issues `Overwrite`, later checkpoint commits issue `Append`. OVERWRITE
+> jobs are therefore safe with parallelism &gt; 1.
 
 ### Vector index
 
@@ -54,6 +60,30 @@ catalog types are `'lance'` (directory/S3) and `'lance-namespace'` (dir/rest).
 | `vector.ef` | ❌ | 100 | HNSW search width |
 | `vector.refine-factor` | ❌ | — | Refine factor for recall |
 
+## Primary key and changelog mode
+
+Declare a primary key to switch the sink from append-only to upsert:
+
+```sql
+CREATE TABLE users (
+    id BIGINT,
+    name STRING,
+    embedding ARRAY<FLOAT>,
+    PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+    'connector' = 'lance',
+    'path' = '/data/users'
+);
+```
+
+| Declared schema | Changelog mode accepted by the sink |
+|---|---|
+| no primary key | `INSERT` only |
+| `PRIMARY KEY` | `INSERT`, `UPDATE_AFTER`, `DELETE` (`UPDATE_BEFORE` is dropped) |
+
+Upserts are applied by `Dataset.mergeInsert` in the serial committer; rows are `keyBy` the primary
+key so all events for one key reach the same subtask. Composite primary keys are supported.
+
 ## Catalog options (`type = 'lance'`)
 
 Directory or S3 warehouse.
@@ -77,3 +107,21 @@ Directory or S3 warehouse.
 | `root` | ❌ | — | Root path for directory namespace |
 | `uri` | ❌ | — | URI for REST namespace |
 | `default-database` | ❌ | default | Default database name |
+
+## Hadoop-family filesystem options
+
+Any option prefixed with `hadoop.` is stripped and injected into the Hadoop `Configuration` used to
+resolve the dataset path, so `hdfs://` / `tbdsfs://` / `viewfs://` locations can be reached without
+a `core-site.xml` on the node:
+
+```sql
+CREATE TABLE hdfs_table (
+    id BIGINT,
+    embedding ARRAY<FLOAT>
+) WITH (
+    'connector' = 'lance',
+    'path' = 'tbdsfs:///path/to/dataset',
+    'hadoop.tbdsfs.meta' = 'zk://namenode:2181/tbdsfs',
+    'hadoop.fs.defaultFS' = 'tbdsfs:///'
+);
+```

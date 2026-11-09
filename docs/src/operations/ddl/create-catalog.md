@@ -71,10 +71,28 @@ CREATE CATALOG my_lance WITH (
 
 ## Supported DDL
 
-| Statement | Status |
-|---|---|
-| `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE` | ✅ |
-| `SHOW DATABASES` / `SHOW TABLES` | ✅ |
-| `CREATE TABLE` / `DROP TABLE` / `RENAME TABLE` | ✅ |
-| `ALTER TABLE` | ❌ — not supported (structure immutable) |
-| `CREATE INDEX` | ❌ — no SQL DDL; configure `index.*` on the table |
+| Statement | `lance` (directory/S3) | `lance-namespace` |
+|---|---|---|
+| `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE` | ✅ | ✅ |
+| `SHOW DATABASES` / `SHOW TABLES` | ✅ | ✅ |
+| `CREATE TABLE` / `DROP TABLE` | ✅ | ✅ |
+| `RENAME TABLE` | ✅ | ❌ — not supported |
+| `ALTER TABLE` (add / rename / drop column) | ✅ | ❌ — not supported yet |
+| `CREATE INDEX` | ❌ — no SQL DDL; configure `index.*` on the table | ❌ |
+
+### ALTER TABLE
+
+On the `lance` catalog, `ALTER TABLE` performs schema evolution on the underlying dataset:
+
+| Change | Supported | Notes |
+|---|---|---|
+| `ADD COLUMN` | ✅ | New column is added to the Arrow schema |
+| `DROP COLUMN` | ✅ | Column is removed from the Arrow schema |
+| `RENAME COLUMN` | ✅ | Metadata-only rename |
+| Change column type | ❌ | Rejected — `castTo` in Lance Java SDK 7.0.0 is a silent no-op, so widening would corrupt data silently |
+
+```sql
+ALTER TABLE vectors ADD (source STRING);
+ALTER TABLE vectors RENAME COLUMN content TO body;
+ALTER TABLE vectors DROP source;
+```

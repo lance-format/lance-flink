@@ -36,6 +36,7 @@ read/search throughput and write amplification in the Lance Flink connector.
 |---|---|---|
 | `write.batch-size` | 1024 | Rows buffered before a flush; larger = fewer, bigger writes |
 | `write.max-rows-per-file` | 1000000 | Rows per data file; larger = fewer files, larger compaction units |
+| `write.memory-cap-bytes` | -1 | Buffered-bytes threshold that forces an early fragment materialization. `-1` (unbounded) removes the orphan-file window at the cost of memory growing with the checkpoint interval; set an explicit cap for jobs with long checkpoint intervals |
 
 ## Distance metrics
 

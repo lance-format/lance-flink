@@ -30,15 +30,47 @@ CREATE TABLE doc_embeddings (
     'index.column' = 'embedding',
     'index.num-partitions' = '256',
     'index.num-sub-vectors' = '16',
+    'index.num-bits' = '8',
     'vector.metric' = 'COSINE'
 );
 ```
+
+Index tuning knobs (all optional, shown with defaults):
+
+| `index.type` | Options |
+|---|---|
+| `IVF_PQ` | `index.num-partitions` (256), `index.num-sub-vectors` (auto), `index.num-bits` (8) |
+| `IVF_HNSW` | `index.num-partitions` (256), `index.max-level` (7), `index.m` (16), `index.ef-construction` (100) |
+| `IVF_FLAT` | `index.num-partitions` (256) |
+
+Building the index itself is done through `LanceIndexBuilder` (see
+[Performance](../../performance.md)); the `index.*` table options carry the configuration.
 
 ## Required options
 
 | Option | Description |
 |---|---|
 | `path` | Path to the Lance dataset |
+
+## Primary key tables
+
+Add `PRIMARY KEY ... NOT ENFORCED` to switch the table from append-only to upsert:
+
+```sql
+CREATE TABLE users (
+    id BIGINT,
+    name STRING,
+    embedding ARRAY<FLOAT>,
+    PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+    'connector' = 'lance',
+    'path' = '/data/users'
+);
+```
+
+Composite primary keys are supported, and the constraint is persisted with the dataset so it
+survives a catalog round-trip. See [INSERT INTO](../dml/insert-into.md) for the changelog modes
+this enables.
 
 ## Type mapping
 

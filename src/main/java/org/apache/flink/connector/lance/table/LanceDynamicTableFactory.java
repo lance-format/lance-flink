@@ -141,6 +141,30 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
             .noDefaultValue()
             .withDescription("PQ sub-vector count");
 
+    public static final ConfigOption<Integer> INDEX_NUM_BITS = ConfigOptions
+            .key("index.num-bits")
+            .intType()
+            .defaultValue(8)
+            .withDescription("PQ quantization bits (1-16)");
+
+    public static final ConfigOption<Integer> INDEX_MAX_LEVEL = ConfigOptions
+            .key("index.max-level")
+            .intType()
+            .defaultValue(7)
+            .withDescription("HNSW index max level");
+
+    public static final ConfigOption<Integer> INDEX_M = ConfigOptions
+            .key("index.m")
+            .intType()
+            .defaultValue(16)
+            .withDescription("HNSW connections per level");
+
+    public static final ConfigOption<Integer> INDEX_EF_CONSTRUCTION = ConfigOptions
+            .key("index.ef-construction")
+            .intType()
+            .defaultValue(100)
+            .withDescription("HNSW construction search width");
+
     public static final ConfigOption<String> VECTOR_COLUMN = ConfigOptions
             .key("vector.column")
             .stringType()
@@ -159,6 +183,32 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
             .defaultValue(20)
             .withDescription("IVF search probe count");
 
+    public static final ConfigOption<Integer> VECTOR_EF = ConfigOptions
+            .key("vector.ef")
+            .intType()
+            .defaultValue(100)
+            .withDescription("HNSW search width");
+
+    public static final ConfigOption<Integer> VECTOR_REFINE_FACTOR = ConfigOptions
+            .key("vector.refine-factor")
+            .intType()
+            .noDefaultValue()
+            .withDescription("Re-rank factor for recall");
+
+    public static final ConfigOption<Long> READ_LIMIT = ConfigOptions
+            .key("read.limit")
+            .longType()
+            .noDefaultValue()
+            .withDescription("Maximum number of rows to read");
+
+    public static final ConfigOption<Long> WRITE_MEMORY_CAP_BYTES = ConfigOptions
+            .key("write.memory-cap-bytes")
+            .longType()
+            .defaultValue(-1L)
+            .withDescription(
+                    "Maximum buffered bytes before an early fragment materialization; "
+                            + "-1 means unbounded");
+
     @Override
     public String factoryIdentifier() {
         return IDENTIFIER;
@@ -175,20 +225,28 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
         options.add(READ_BATCH_SIZE);
+        options.add(READ_LIMIT);
         options.add(READ_COLUMNS);
         options.add(READ_FILTER);
         options.add(READ_VERSION);
         options.add(READ_AS_OF_TIMESTAMP);
         options.add(WRITE_BATCH_SIZE);
+        options.add(WRITE_MEMORY_CAP_BYTES);
         options.add(WRITE_MODE);
         options.add(WRITE_MAX_ROWS_PER_FILE);
         options.add(INDEX_TYPE);
         options.add(INDEX_COLUMN);
         options.add(INDEX_NUM_PARTITIONS);
         options.add(INDEX_NUM_SUB_VECTORS);
+        options.add(INDEX_NUM_BITS);
+        options.add(INDEX_MAX_LEVEL);
+        options.add(INDEX_M);
+        options.add(INDEX_EF_CONSTRUCTION);
         options.add(VECTOR_COLUMN);
         options.add(VECTOR_METRIC);
         options.add(VECTOR_NPROBES);
+        options.add(VECTOR_EF);
+        options.add(VECTOR_REFINE_FACTOR);
         return options;
     }
 
@@ -300,6 +358,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
 
         // Source configuration
         builder.readBatchSize(config.get(READ_BATCH_SIZE));
+        config.getOptional(READ_LIMIT).ifPresent(builder::readLimit);
         config.getOptional(READ_COLUMNS).ifPresent(columns -> {
             if (!columns.isEmpty()) {
                 builder.readColumns(java.util.Arrays.asList(columns.split(",")));
@@ -311,6 +370,7 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
 
         // Sink configuration
         builder.writeBatchSize(config.get(WRITE_BATCH_SIZE));
+        builder.writeMemoryCapBytes(config.get(WRITE_MEMORY_CAP_BYTES));
         builder.writeMode(LanceOptions.WriteMode.fromValue(config.get(WRITE_MODE)));
         builder.writeMaxRowsPerFile(config.get(WRITE_MAX_ROWS_PER_FILE));
 
@@ -319,11 +379,17 @@ public class LanceDynamicTableFactory implements DynamicTableSourceFactory, Dyna
         config.getOptional(INDEX_COLUMN).ifPresent(builder::indexColumn);
         builder.indexNumPartitions(config.get(INDEX_NUM_PARTITIONS));
         config.getOptional(INDEX_NUM_SUB_VECTORS).ifPresent(builder::indexNumSubVectors);
+        builder.indexNumBits(config.get(INDEX_NUM_BITS));
+        builder.indexMaxLevel(config.get(INDEX_MAX_LEVEL));
+        builder.indexM(config.get(INDEX_M));
+        builder.indexEfConstruction(config.get(INDEX_EF_CONSTRUCTION));
 
         // Vector search configuration
         config.getOptional(VECTOR_COLUMN).ifPresent(builder::vectorColumn);
         builder.vectorMetric(LanceOptions.MetricType.fromValue(config.get(VECTOR_METRIC)));
         builder.vectorNprobes(config.get(VECTOR_NPROBES));
+        builder.vectorEf(config.get(VECTOR_EF));
+        config.getOptional(VECTOR_REFINE_FACTOR).ifPresent(builder::vectorRefineFactor);
 
         // Hadoop-family FileSystem configuration (e.g. hadoop.tbdsfs.meta), used for tbdsfs/hdfs
         // path resolution

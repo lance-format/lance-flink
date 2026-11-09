@@ -46,3 +46,15 @@ CREATE TABLE lance_table (
 | `read.columns` | Comma-separated columns to read |
 | `read.filter` | SQL `WHERE`-style filter string |
 | `read.limit` | Maximum rows to read |
+
+## Aggregate pushdown
+
+`SupportsAggregatePushDown` lets eligible aggregates run natively in Lance instead of pulling every
+row into Flink:
+
+```sql
+SELECT COUNT(*), MIN(id), MAX(id), SUM(id), AVG(id)
+FROM lance_table;
+```
+
+Aggregates that cannot be translated fall back to Flink execution transparently.

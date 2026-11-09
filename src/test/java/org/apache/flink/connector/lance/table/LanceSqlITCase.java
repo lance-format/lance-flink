@@ -20,7 +20,9 @@ package org.apache.flink.connector.lance.table;
 
 import org.apache.flink.connector.lance.config.LanceOptions;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.BigIntType;
@@ -42,6 +44,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * Lance SQL integration tests.
@@ -86,16 +89,65 @@ class LanceSqlITCase {
 
         assertThat(optionalOptionKeys).contains(
                 "read.batch-size",
+                "read.limit",
                 "read.columns",
                 "read.filter",
+                "read.version",
+                "read.as-of-timestamp",
                 "write.batch-size",
+                "write.memory-cap-bytes",
                 "write.mode",
                 "write.max-rows-per-file",
                 "index.type",
                 "index.column",
+                "index.num-partitions",
+                "index.num-sub-vectors",
+                "index.num-bits",
+                "index.max-level",
+                "index.m",
+                "index.ef-construction",
                 "vector.column",
-                "vector.metric"
+                "vector.metric",
+                "vector.nprobes",
+                "vector.ef",
+                "vector.refine-factor"
         );
+    }
+
+    @Test
+    @DisplayName("Every documented tuning option survives DDL translation")
+    void testDocumentedTuningOptionsAreAcceptedByTheFactory() {
+        // Regression guard: these keys exist in LanceOptions but were missing from the
+        // factory's optionalOptions(), so a WITH clause using them failed at translation
+        // with "Unsupported options found for 'lance'".
+        String[] documentedKeys = {
+            "read.limit",
+            "write.memory-cap-bytes",
+            "index.num-bits",
+            "index.max-level",
+            "index.m",
+            "index.ef-construction",
+            "vector.ef",
+            "vector.refine-factor"
+        };
+
+        for (String key : documentedKeys) {
+            TableEnvironment env = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+            env.executeSql(
+                    "CREATE TABLE probe (id BIGINT, embedding ARRAY<FLOAT>) WITH ("
+                            + "'connector' = 'lance', "
+                            + "'path' = '"
+                            + tempDir.resolve("probe-" + key.replace('.', '-'))
+                            + "', "
+                            + "'"
+                            + key
+                            + "' = '8')");
+
+            // Translation runs the factory's option validation.
+            assertThatCode(() -> env.explainSql("SELECT id FROM probe"))
+                    .as("option '%s' must be accepted by the lance table factory", key)
+                    .doesNotThrowAnyException();
+        }
     }
 
     @Test

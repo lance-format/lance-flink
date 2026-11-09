@@ -42,3 +42,5 @@ CREATE TABLE lance_table (
   `Instant.parse`, `OffsetDateTime.parse`, or `ZonedDateTime.parse`;
   a bare `yyyy-MM-ddTHH:mm:ss` is assumed UTC.
 - A timestamp predating the oldest version raises a clear error.
+- Time travel is read-only: `write.mode = overwrite` replaces the dataset with a new version, so
+  earlier versions stay reachable until Lance garbage-collects them.
