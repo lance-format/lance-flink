@@ -38,15 +38,31 @@ The emitted row is the source row plus a `_distance DOUBLE` column.
 
 ## Search options
 
-Configured on the table DDL or via `LanceOptions`:
+The table function signature exposes only the dataset path, the vector column, the query vector, `k`
+and the metric. The extra search knobs below exist on `LanceOptions` and are consumed by
+`LanceVectorSearch.fromOptions(...)`, **not** by the SQL table function:
 
 | Option | Default | Description |
 |---|---|---|
-| `vector.column` | — | Vector column name |
+| `vector.column` | — | Vector column name (used by `LanceVectorSearch.fromOptions`) |
 | `vector.metric` | `L2` | Distance metric |
 | `vector.nprobes` | 20 | IVF probe count |
 | `vector.ef` | 100 | HNSW search width |
 | `vector.refine-factor` | — | Re-rank factor for recall |
+
+To tune `nprobes` / `ef` / `refine-factor`, build the searcher in Java:
+
+```java
+LanceVectorSearch search =
+        LanceVectorSearch.builder()
+                .datasetPath("/data/vectors")
+                .columnName("embedding")
+                .metricType(MetricType.COSINE)
+                .nprobes(40)
+                .ef(200)
+                .refineFactor(4)
+                .build();
+```
 
 ## Example
 

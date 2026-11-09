@@ -18,6 +18,7 @@
 
 package org.apache.flink.connector.lance.table;
 
+import org.apache.flink.connector.lance.LanceAggregateSource;
 import org.apache.flink.connector.lance.LanceSource;
 import org.apache.flink.connector.lance.aggregate.AggregateInfo;
 import org.apache.flink.connector.lance.config.LanceOptions;
@@ -38,6 +39,7 @@ import org.apache.flink.table.expressions.CallExpression;
 import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.expressions.ValueLiteralExpression;
+import org.apache.flink.table.functions.AggregateFunctionDefinition;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.types.DataType;
@@ -106,6 +108,30 @@ public class LanceDynamicTableSource implements ScanTableSource,
             projectedRowType = new RowType(projectedFieldList);
         }
 
+        // Aggregate push-down was accepted: the runtime source must emit the aggregate result.
+        // Without this branch the planner would still fold the aggregate into the scan, and the
+        // raw rows would be returned where a single aggregate row is expected.
+        if (aggregatePushDownAccepted && aggregateInfo != null) {
+            final LanceOptions aggregateOptions = buildRuntimeOptions(rowType);
+            final RowType sourceRowType = rowType;
+            final AggregateInfo pushedInfo = aggregateInfo;
+            return new DataStreamScanProvider() {
+                @Override
+                public DataStream<RowData> produceDataStream(
+                        ProviderContext providerContext, StreamExecutionEnvironment execEnv) {
+                    LanceAggregateSource source =
+                            new LanceAggregateSource(aggregateOptions, sourceRowType, pushedInfo);
+                    return LanceSourceStreamBridge.toStream(
+                            execEnv, source, "LanceAggregateSource");
+                }
+
+                @Override
+                public boolean isBounded() {
+                    return true;
+                }
+            };
+        }
+
         LanceOptions finalOptions = buildRuntimeOptions(rowType);
         final RowType finalRowType = projectedRowType;
 
@@ -135,6 +161,11 @@ public class LanceDynamicTableSource implements ScanTableSource,
      * Build the {@link LanceOptions} that will actually be handed to the runtime source, applying
      * projection / limit / filter push-down on top of the original SQL-WITH options.
      *
+     * <p>Planner push-down wins over the declared table option, but the option is no longer dropped
+     * when the planner does not push anything: a static {@code read.limit} / {@code read.columns}
+     * in the WITH clause used to be silently ignored because only the planner-provided values were
+     * copied here.
+     *
      * <p>Exposed at package scope so unit tests can assert that push-down does not lose any
      * important options (e.g. time-travel {@code read.version} / {@code read.as-of-timestamp} —
      * see issue #5).
@@ -161,17 +192,21 @@ public class LanceDynamicTableSource implements ScanTableSource,
             optionsBuilder.readAsOfTimestamp(options.getReadAsOfTimestamp());
         }
 
-        // Set Limit (if any)
+        // Limit: the planner-pushed value wins, otherwise fall back to the declared table option.
         if (limit != null) {
             optionsBuilder.readLimit(limit);
+        } else if (options.getReadLimit() != null) {
+            optionsBuilder.readLimit(options.getReadLimit());
         }
 
-        // Set columns to read
+        // Columns: the planner-pushed projection wins, otherwise honour the declared option.
         if (projectedFields != null) {
             List<String> columnNames = Arrays.stream(projectedFields)
                     .mapToObj(i -> rowType.getFieldNames().get(i))
                     .collect(Collectors.toList());
             optionsBuilder.readColumns(columnNames);
+        } else if (options.getReadColumns() != null && !options.getReadColumns().isEmpty()) {
+            optionsBuilder.readColumns(options.getReadColumns());
         }
 
         return optionsBuilder.build();
@@ -430,33 +465,32 @@ public class LanceDynamicTableSource implements ScanTableSource,
             List<int[]> groupingSets,
             List<AggregateExpression> aggregateExpressions,
             DataType producedDataType) {
-        
-        // Currently only support simple single grouping set
+
+        // Only global aggregates (no GROUP BY) are pushed down. A grouped aggregate would need the
+        // group-key columns to line up with the projected scan output across the FLIP-27
+        // serialization boundary; that layout is not stable yet, so grouped aggregates are left to
+        // Flink. Rejecting push-down here is always safe — Flink computes the aggregate itself.
         if (groupingSets.size() != 1) {
             return false;
         }
-
         int[] groupingSet = groupingSets.get(0);
+        if (groupingSet != null && groupingSet.length > 0) {
+            return false;
+        }
+
         RowType rowType = (RowType) physicalDataType.getLogicalType();
         List<String> fieldNames = rowType.getFieldNames();
 
         try {
             AggregateInfo.Builder builder = AggregateInfo.builder();
-
-            // Handle grouping columns
-            List<String> groupByColumns = new ArrayList<>();
-            for (int fieldIndex : groupingSet) {
-                if (fieldIndex >= 0 && fieldIndex < fieldNames.size()) {
-                    groupByColumns.add(fieldNames.get(fieldIndex));
-                }
-            }
-            builder.groupBy(groupByColumns);
-            builder.groupByFieldIndices(groupingSet);
+            builder.groupBy(new ArrayList<>());
+            builder.groupByFieldIndices(new int[0]);
 
             // Handle aggregate expressions
             int aggIndex = 0;
             for (AggregateExpression aggExpr : aggregateExpressions) {
-                AggregateInfo.AggregateCall aggCall = convertAggregateExpression(aggExpr, fieldNames, aggIndex++);
+                AggregateInfo.AggregateCall aggCall =
+                        convertAggregateExpression(aggExpr, fieldNames, aggIndex++);
                 if (aggCall == null) {
                     // Unsupported aggregate function, reject push-down
                     return false;
@@ -475,73 +509,88 @@ public class LanceDynamicTableSource implements ScanTableSource,
     }
 
     /**
-     * Convert Flink aggregate expression to internal aggregate call
+     * Convert a Flink aggregate expression to the internal aggregate call.
+     *
+     * <p>Flink 2.x hands {@code applyAggregates} an {@link AggregateFunctionDefinition} whose
+     * aggregate function is a concrete planner class such as {@code LongSumAggFunction},
+     * {@code Count1AggFunction} or {@code LongMaxAggFunction} — not one of the
+     * {@code BuiltInFunctionDefinitions} constants. Matching those constants therefore never
+     * succeeded, which silently disabled aggregate push-down. The mapping below is by simple class
+     * name prefix so it keeps working across planner variants ({@code SumAggFunction},
+     * {@code Sum0AggFunction}, {@code LongSumAggFunction}, ...).
+     *
+     * <p>Returns {@code null} for any shape that cannot be evaluated natively; the caller then
+     * rejects push-down and Flink computes the aggregate itself.
      */
     private AggregateInfo.AggregateCall convertAggregateExpression(
-            AggregateExpression aggExpr, 
+            AggregateExpression aggExpr,
             List<String> fieldNames,
             int aggIndex) {
-        
-        FunctionDefinition funcDef = aggExpr.getFunctionDefinition();
+
         List<FieldReferenceExpression> args = aggExpr.getArgs();
         String alias = "agg_" + aggIndex;
+        String name = aggFunctionName(aggExpr.getFunctionDefinition());
+        if (name == null) {
+            return null;
+        }
 
-        // COUNT(*)
-        if (funcDef == BuiltInFunctionDefinitions.COUNT) {
-            if (args.isEmpty()) {
-                // COUNT(*)
+        boolean distinct = aggExpr.isDistinct();
+        // COUNT(*) and COUNT(column) are the only aggregates whose result is a row count.
+        if (name.startsWith("Count1") || name.startsWith("Count")) {
+            // COUNT(*) carries no argument; COUNT(column) / COUNT(DISTINCT column) carry one.
+            if (args.isEmpty() && !distinct) {
                 return new AggregateInfo.AggregateCall(
                         AggregateInfo.AggregateFunction.COUNT, null, alias);
-            } else {
-                // COUNT(column)
-                String columnName = args.get(0).getName();
-                return new AggregateInfo.AggregateCall(
-                        AggregateInfo.AggregateFunction.COUNT, columnName, alias);
             }
-        }
-
-        // SUM
-        if (funcDef == BuiltInFunctionDefinitions.SUM || funcDef == BuiltInFunctionDefinitions.SUM0) {
-            if (args.isEmpty()) {
+            if (args.size() != 1) {
                 return null;
             }
             String columnName = args.get(0).getName();
-            return new AggregateInfo.AggregateCall(
-                    AggregateInfo.AggregateFunction.SUM, columnName, alias);
+            AggregateInfo.AggregateFunction function =
+                    distinct
+                            ? AggregateInfo.AggregateFunction.COUNT_DISTINCT
+                            : AggregateInfo.AggregateFunction.COUNT;
+            return new AggregateInfo.AggregateCall(function, columnName, alias);
         }
 
-        // AVG
-        if (funcDef == BuiltInFunctionDefinitions.AVG) {
-            if (args.isEmpty()) {
-                return null;
+        // SUM / SUM0 / AVG / MIN / MAX all require exactly one argument.
+        if (args.size() != 1) {
+            return null;
+        }
+        AggregateInfo.AggregateFunction function;
+        if (name.startsWith("Sum") || name.startsWith("Sum0")) {
+            function = AggregateInfo.AggregateFunction.SUM;
+        } else if (name.startsWith("Avg")) {
+            function = AggregateInfo.AggregateFunction.AVG;
+        } else if (name.startsWith("Min")) {
+            function = AggregateInfo.AggregateFunction.MIN;
+        } else if (name.startsWith("Max")) {
+            function = AggregateInfo.AggregateFunction.MAX;
+        } else {
+            return null;
+        }
+        // SUM(DISTINCT col) / AVG(DISTINCT col) are not implemented natively.
+        if (distinct) {
+            return null;
+        }
+        return new AggregateInfo.AggregateCall(function, args.get(0).getName(), alias);
+    }
+
+    /**
+     * Extracts the aggregate function's simple name from the definition, or {@code null} when the
+     * definition does not describe a user-level aggregate (e.g. a table aggregate).
+     */
+    private static String aggFunctionName(FunctionDefinition definition) {
+        if (definition instanceof AggregateFunctionDefinition) {
+            Object function = ((AggregateFunctionDefinition) definition).getAggregateFunction();
+            if (function != null) {
+                return function.getClass().getSimpleName();
             }
-            String columnName = args.get(0).getName();
-            return new AggregateInfo.AggregateCall(
-                    AggregateInfo.AggregateFunction.AVG, columnName, alias);
         }
-
-        // MIN
-        if (funcDef == BuiltInFunctionDefinitions.MIN) {
-            if (args.isEmpty()) {
-                return null;
-            }
-            String columnName = args.get(0).getName();
-            return new AggregateInfo.AggregateCall(
-                    AggregateInfo.AggregateFunction.MIN, columnName, alias);
-        }
-
-        // MAX
-        if (funcDef == BuiltInFunctionDefinitions.MAX) {
-            if (args.isEmpty()) {
-                return null;
-            }
-            String columnName = args.get(0).getName();
-            return new AggregateInfo.AggregateCall(
-                    AggregateInfo.AggregateFunction.MAX, columnName, alias);
-        }
-
-        // Unsupported aggregate function
-        return null;
+        // Fall back to the definition's own name, which some planner paths set to the function
+        // name instead of wrapping it in an AggregateFunctionDefinition.
+        String name = definition.toString();
+        return name == null || name.isEmpty() ? null : name;
     }
 
     /**

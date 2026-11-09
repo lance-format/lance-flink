@@ -24,16 +24,19 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
 
 /**
- * Flink version bridge: mounts {@link LanceSource} as a {@link DataStream}.
+ * Flink version bridge: mounts a Lance source as a {@link DataStream}.
  *
- * <p>This file is the "Flink 1.x version": {@code LanceSource} implements {@code SourceFunction},
- * mounted via {@link StreamExecutionEnvironment#addSource}.
+ * <p>This file is the "Flink 1.x version": it mounts the source via {@link
+ * StreamExecutionEnvironment#addSource}.
  *
  * <p>The {@code lance-flink-2.1} submodule provides another implementation of the same class in the
  * same package (using the FLIP-27
  * {@code env.fromSource(Source, WatermarkStrategy.noWatermarks(), name)}), and excludes this file
  * from the 2.1 compilation via the maven-compiler-plugin {@code <excludes>}, making the version
  * switch transparent to the upper {@code LanceDynamicTableSource}.
+ *
+ * <p>Both a plain scan ({@link LanceSource}, a {@code SourceFunction}) and an aggregate-pushdown
+ * scan ({@code LanceAggregateSource}) are mounted through the two overloads below.
  */
 final class LanceSourceStreamBridge {
 
@@ -41,6 +44,13 @@ final class LanceSourceStreamBridge {
 
     static DataStream<RowData> toStream(
             StreamExecutionEnvironment env, LanceSource source, String name) {
+        return env.addSource(source, name);
+    }
+
+    static DataStream<RowData> toStream(
+            StreamExecutionEnvironment env,
+            org.apache.flink.connector.lance.LanceAggregateSource source,
+            String name) {
         return env.addSource(source, name);
     }
 }

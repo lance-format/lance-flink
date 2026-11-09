@@ -43,8 +43,17 @@ Index tuning knobs (all optional, shown with defaults):
 | `IVF_HNSW` | `index.num-partitions` (256), `index.max-level` (7), `index.m` (16), `index.ef-construction` (100) |
 | `IVF_FLAT` | `index.num-partitions` (256) |
 
-Building the index itself is done through `LanceIndexBuilder` (see
-[Performance](../../performance.md)); the `index.*` table options carry the configuration.
+> **The `index.*` options do not build the index by themselves.** They are carried into
+> `LanceOptions`, and building happens through `LanceIndexBuilder`, which reads them via
+> `LanceIndexBuilder.fromOptions(options)`:
+>
+> ```java
+> LanceOptions options = /* same options the table was created with */;
+> IndexBuildResult result = LanceIndexBuilder.fromOptions(options).buildIndex();
+> ```
+>
+> Calling `buildIndex()` after the data has been written is what materializes the vector index in
+> Lance. Until then, queries fall back to a brute-force scan.
 
 ## Required options
 

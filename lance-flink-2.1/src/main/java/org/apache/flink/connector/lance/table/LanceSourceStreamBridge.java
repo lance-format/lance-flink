@@ -25,15 +25,17 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
 
 /**
- * Flink version bridge: mounts {@link LanceSource} as a {@link DataStream}.
+ * Flink version bridge: mounts a Lance source as a {@link DataStream}.
  *
- * <p>This file is the "Flink 2.x version": {@code LanceSource} implements the FLIP-27
- * {@code Source<RowData, LanceSplit, LanceEnumState>}, via
- * {@link StreamExecutionEnvironment#fromSource}. The Lance connector currently only supports
- * batch reads, so {@link WatermarkStrategy#noWatermarks()} suffices.
+ * <p>This file is the "Flink 2.x version": sources implement the FLIP-27 {@code Source} interface
+ * and are mounted via {@link StreamExecutionEnvironment#fromSource}. The Lance connector currently
+ * only supports batch reads, so {@link WatermarkStrategy#noWatermarks()} suffices.
  *
- * <p>This overrides the same-named class in the root src (the 1.x version); the root-src version
- * is excluded via maven-compiler-plugin {@code <excludes>} in the 2.1 module pom.
+ * <p>This overrides the same-named class in the root src (the 1.x version); the root-src version is
+ * excluded via maven-compiler-plugin {@code <excludes>} in the 2.1 module pom.
+ *
+ * <p>Both a plain scan ({@link LanceSource}) and an aggregate-pushdown scan ({@code
+ * LanceAggregateSource}) are mounted through the two overloads below.
  */
 final class LanceSourceStreamBridge {
 
@@ -41,6 +43,13 @@ final class LanceSourceStreamBridge {
 
     static DataStream<RowData> toStream(
             StreamExecutionEnvironment env, LanceSource source, String name) {
+        return env.fromSource(source, WatermarkStrategy.noWatermarks(), name);
+    }
+
+    static DataStream<RowData> toStream(
+            StreamExecutionEnvironment env,
+            org.apache.flink.connector.lance.LanceAggregateSource source,
+            String name) {
         return env.fromSource(source, WatermarkStrategy.noWatermarks(), name);
     }
 }
