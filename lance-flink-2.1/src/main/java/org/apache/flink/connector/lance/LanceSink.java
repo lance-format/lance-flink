@@ -62,30 +62,13 @@ import java.io.IOException;
  * {@code RichSinkFunction} version so that shared upper-layer code (e.g.
  * {@code LanceDynamicTableSink}) need not be aware of version differences.
  *
- * <p><b>⚠️ Known limitation (R3) — OVERWRITE with parallelism &gt; 1</b>:
- * Under {@link LanceOptions.WriteMode#OVERWRITE}, the "pre-cleanup" action is currently performed
- * by subtask 0 of {@link LanceSinkWriter}, which calls {@code Dataset.drop(path)} before
- * {@code Fragment.write()}. This call must happen before any subtask's first
- * {@code Fragment.write()}, otherwise the fragment list would point to {@code .lance} files that
- * the drop has deleted.
- *
- * <p>Flink guarantees construction and write ordering within **the same subtask** (via the
- * mailbox), but there is no barrier across **different subtasks**. Under skewed startup timing on
- * a real cluster, subtask-N (N &gt; 0) may start {@code Fragment.write()} before subtask 0's drop
- * completes; the {@code .lance} file it just materialized would then be deleted by subtask 0's
- * drop, losing part of the current checkpoint window's data (the next checkpoint window is already
- * clean and unaffected).
- *
- * <p><b>Mitigations</b> (choose one):
- * <ul>
- *   <li><b>Recommended</b>: set {@code sink.parallelism = 1} explicitly for OVERWRITE jobs — via
- *       the {@code 'sink.parallelism' = '1'} table option on the Flink SQL side, or
- *       {@code dataStream.sinkTo(sink).setParallelism(1)} on the DataStream side;</li>
- *   <li>or orchestrate a "parallelism=1 OVERWRITE truncate job first, then start the real
- *       parallelism=N APPEND job";</li>
- *   <li>Tracking: a future version will move OVERWRITE pre-cleanup to a staging-path
- *       commit-rename model on the committer side to eliminate this race.</li>
- * </ul>
+ * <p><b>OVERWRITE semantics</b>: the "replace the dataset once per job" decision is owned by
+ * {@link LanceCommitter} — {@link LanceSinkWriter} performs no {@code Dataset.drop}
+ * pre-cleanup at all. The committer is serial and consistent across subtasks; it tags every
+ * version it commits with the {@code flink.job-id} transaction property, so the job's first
+ * commit replaces the previous result with an {@link org.lance.operation.Overwrite} while later
+ * checkpoint commits append to it. This removes the data-loss race that OVERWRITE suffered with
+ * parallelism &gt; 1 when a late-starting subtask 0 dropped peer subtasks' materialized files.
  */
 public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommittable> {
 
@@ -112,7 +95,7 @@ public class LanceSink implements Sink<RowData>, SupportsCommitter<LanceCommitta
     @Override
     public Committer<LanceCommittable> createCommitter(CommitterInitContext context)
             throws IOException {
-        return new LanceCommitter();
+        return new LanceCommitter(context.getJobInfo().getJobId().toString());
     }
 
     @Override
