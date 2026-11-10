@@ -63,14 +63,20 @@
 - Maven 3.6+
 - Lance 7.0.0 Java SDK
 
-> **注意**：Flink 2.x 对 Source/Sink API 进行了重大重构（FLIP-27 Source V2 + Sink V2 + `SupportsCommitter`）。
-> 本 connector 在 1.20 和 2.1 上共享大部分源码，仅对版本不兼容部分通过模块隔离
-> （`lance-flink-2.1/` 子模块）提供替代实现。
+> **Note**: Flink 2.x reworked the Source/Sink APIs (FLIP-27 Source V2 + Sink V2 +
+> `SupportsCommitter`). This connector shares most of its sources between 1.20 and 2.1 and isolates
+> only the version-incompatible parts in the `lance-flink-2.1/` submodule, which provides
+> replacement implementations.
 >
-> Flink 1.18 / 1.19 自 0.2.0 起不再构建与发布（两者在 Flink 2.1 适配落地前均已 EOL），
-> 对应 artifact 停留在 0.1.0。
+> Flink 1.18 and 1.19 are no longer built or released from 0.2.0 on — both reached EOL before the
+> Flink 2.1 support landed. Their artifacts stay at 0.1.0.
 
-> **Flink 2.1 OVERWRITE 语义**：`write.mode = overwrite` 的「每个 job 替换一次」判定由串行的 `LanceCommitter` 承担 —— `LanceSinkWriter` 不再执行任何 `Dataset.drop` 预清理。Committer 给它在 OVERWRITE 模式下产生的每个版本都打上 `flink.job-id` transaction property：job 首次提交执行 `Overwrite` 替换旧数据集，后续 checkpoint 提交自动切换为 `Append`，因此 OVERWRITE 作业可以安全地以并行度 > 1 运行。
+> **Flink 2.1 OVERWRITE semantics**: the "replace the dataset once per job" decision is owned by the
+> serial `LanceCommitter` — `LanceSinkWriter` performs no `Dataset.drop` pre-cleanup at all. The
+> committer tags every version it produces in OVERWRITE mode with the `flink.job-id` transaction
+> property: the job's first commit issues `Overwrite` to replace the previous dataset, and later
+> checkpoint commits switch to `Append` automatically. OVERWRITE jobs are therefore safe to run
+> with parallelism &gt; 1.
 
 ### Maven Dependency
 
@@ -342,10 +348,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📋 Roadmap
 
-- [x] **Flink 2.1 支持**（FLIP-27 Source V2 + Sink V2 / `SupportsCommitter`，要求 JDK 17+，见 #85）
-- [x] **主键 Upsert / Delete 与 Schema Evolution**（见 #76）
-- [x] **Time Travel**（`read.version` / `read.as-of-timestamp`）
-- [x] **Hadoop 系文件系统读取**（`hdfs://` / `tbdsfs://` / `viewfs://`）
+- [x] **Flink 2.1 support** (FLIP-27 Source V2 + Sink V2 / `SupportsCommitter`, JDK 17+ required, see #85)
+- [x] **Primary-key upsert / delete and schema evolution** (see #76)
+- [x] **Time travel** (`read.version` / `read.as-of-timestamp`)
+- [x] **Hadoop-family filesystem reads** (`hdfs://` / `tbdsfs://` / `viewfs://`)
 - [ ] Streaming CDC support
 - [ ] Delta Lake interoperability
 - [ ] Distributed index building
